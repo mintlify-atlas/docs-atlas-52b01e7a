@@ -1,0 +1,160 @@
+{
+  "projectType": "framework",
+  "projectName": "BlueLibs Runner",
+  "projectDescription": "TypeScript-first dependency injection framework for building modular, testable applications with tasks, resources, and lifecycle management.",
+  "theme": "aspen",
+  "primaryColor": "#3B82F6",
+  "lightColor": "#60A5FA",
+  "darkColor": "#2563EB",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/tasks",
+              "concepts/resources",
+              "concepts/events",
+              "concepts/hooks",
+              "concepts/lifecycle"
+            ]
+          },
+          {
+            "group": "Middleware",
+            "pages": [
+              "middleware/overview",
+              "middleware/retry",
+              "middleware/timeout",
+              "middleware/circuit-breaker",
+              "middleware/cache",
+              "middleware/rate-limit",
+              "middleware/custom"
+            ]
+          },
+          {
+            "group": "Advanced Features",
+            "pages": [
+              "advanced/async-context",
+              "advanced/dependency-injection",
+              "advanced/tags",
+              "advanced/overrides",
+              "advanced/error-handling"
+            ]
+          },
+          {
+            "group": "Node.js Features",
+            "pages": [
+              "node/durable-workflows",
+              "node/http-tunnels",
+              "node/exposure"
+            ]
+          },
+          {
+            "group": "Testing",
+            "pages": [
+              "testing/overview",
+              "testing/test-resources",
+              "testing/mocking"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/multi-platform",
+              "guides/production-readiness",
+              "guides/migration",
+              "guides/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core API",
+            "pages": [
+              "api/r",
+              "api/run",
+              "api/globals"
+            ]
+          },
+          {
+            "group": "Builders",
+            "pages": [
+              "api/builders/task",
+              "api/builders/resource",
+              "api/builders/event",
+              "api/builders/hook",
+              "api/builders/middleware"
+            ]
+          },
+          {
+            "group": "Runtime",
+            "pages": [
+              "api/runtime/runtime",
+              "api/runtime/execution"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Examples",
+        "groups": [
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/express-openapi",
+              "examples/fastify-mikroorm",
+              "examples/aws-lambda",
+              "examples/durable-workflows"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Explicit dependency injection with TypeScript",
+    "Tasks with middleware and validation",
+    "Resources with lifecycle management",
+    "Built-in reliability middleware (retry, timeout, circuit breaker, cache, rate limit)",
+    "Multi-platform support (Node.js, Browser, Edge)",
+    "Durable workflows for Node.js",
+    "HTTP tunnels for distributed execution",
+    "Type-safe events and hooks",
+    "100% test coverage enforced"
+  ],
+  "publicApiSurface": [
+    "r.task()",
+    "r.resource()",
+    "r.event()",
+    "r.hook()",
+    "r.asyncContext()",
+    "r.tag()",
+    "r.override()",
+    "r.error()",
+    "r.middleware.task()",
+    "r.middleware.resource()",
+    "run()",
+    "globals.middleware",
+    "globals.events",
+    "globals.resources",
+    "globals.tags",
+    "globals.tunnels",
+    "createTestResource()",
+    "Node: createDurableWorkflow()",
+    "Node: createHttpTunnel()",
+    "Node: createExposure()"
+  ]
+}
