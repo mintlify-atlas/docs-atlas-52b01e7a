@@ -72,6 +72,18 @@ Runner provides production-ready middleware out of the box:
   </Card>
 </CardGroup>
 
+### Additional Built-in Middleware
+
+Runner also includes specialized middleware for advanced use cases:
+
+- **Concurrency** (`globals.middleware.task.concurrency`) - Limit concurrent executions with semaphores
+- **Fallback** (`globals.middleware.task.fallback`) - Provide backup value or task if primary fails
+- **Debounce** (`globals.middleware.task.debounce`) - Delay execution until quiet period ends
+- **Throttle** (`globals.middleware.task.throttle`) - Ensure execution at most once per time window
+- **Require Context** (`globals.middleware.task.requireContext`) - Enforce async context availability
+
+See [Custom Middleware](/middleware/custom) for examples and the [API Reference](/api/globals) for full configuration details.
+
 ## Quick Example
 
 Here's how to add retry and timeout to an API call:
