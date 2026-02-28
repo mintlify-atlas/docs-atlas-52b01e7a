@@ -1,0 +1,412 @@
+---
+title: Dependency Injection
+description: Explicit, type-safe dependency injection patterns in Runner
+---
+
+Runner's dependency injection is **explicit and composition-first**. You write normal async functions; Runner wires dependencies, middleware, events, and lifecycle. No decorators, no reflection, no magic—just plain TypeScript with full type inference.
+
+## Core Principles
+
+<CardGroup cols={2}>
+  <Card title="Explicit Dependencies" icon="list">
+    Dependencies are declared up front with `.dependencies()`, not discovered at runtime
+  </Card>
+  
+  <Card title="Type-Driven" icon="code">
+    TypeScript inference flows through tasks, resources, and middleware automatically
+  </Card>
+  
+  <Card title="Composition Over Inheritance" icon="layer-group">
+    Build complex behavior by composing simple functions and resources
+  </Card>
+  
+  <Card title="Testable by Default" icon="vial">
+    Call `.run()` with mocks or run the full app—no special test harnesses
+  </Card>
+</CardGroup>
+
+## Basic Dependency Injection
+
+Declare what a task needs, and Runner provides it:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+// Define resources (singletons)
+const database = r
+  .resource("app.db")
+  .init(async () => connectToDB())
+  .build();
+
+const logger = r
+  .resource("app.logger")
+  .init(async () => createLogger())
+  .build();
+
+// Task with explicit dependencies
+const createUser = r
+  .task("users.create")
+  .dependencies({ db: database, logger }) // ← Declare what you need
+  .run(async (input, { db, logger }) => {  // ← Runner injects them
+    await logger.info("Creating user", input);
+    return db.users.insert(input);
+  })
+  .build();
+
+// Wire everything together
+const app = r
+  .resource("app")
+  .register([database, logger, createUser])
+  .build();
+
+const { runTask } = await run(app);
+await runTask(createUser, { name: "Ada", email: "ada@example.com" });
+```
+
+## Static vs. Dynamic Dependencies
+
+Dependencies can be defined as a static object or as a function:
+
+```typescript
+// Static dependencies (most common)
+const userService = r
+  .resource("app.services.user")
+  .dependencies({ database, logger }) // Object - evaluated immediately
+  .init(async (_config, { database, logger }) => {
+    // Dependencies are available here
+  })
+  .build();
+
+// Dynamic dependencies (for conditional or circular dependencies)
+const advancedService = r
+  .resource("app.services.advanced")
+  .dependencies((config) => ({
+    // Function - evaluated when needed
+    database,
+    logger,
+    conditionalService: config.useRedis ? redisService : memoryService,
+  }))
+  .init(async (_config, { database, logger, conditionalService }) => {
+    // Same interface, different evaluation timing
+  })
+  .build();
+```
+
+**When to use dynamic dependencies:**
+
+- Conditional dependencies based on configuration
+- Breaking circular type inference (see [Handling Circular Dependencies](/advanced/dependency-injection#circular-dependencies))
+- Late-binding scenarios where dependency choice depends on runtime config
+
+## Resource Dependencies
+
+Resources can depend on other resources, creating a dependency graph:
+
+```typescript
+const config = r
+  .resource("app.config")
+  .init(async () => ({
+    databaseUrl: process.env.DATABASE_URL,
+    redisUrl: process.env.REDIS_URL,
+  }))
+  .build();
+
+const database = r
+  .resource("app.db")
+  .dependencies({ config }) // ← Depends on config
+  .init(async (_cfg, { config }) => {
+    return connect(config.databaseUrl);
+  })
+  .dispose(async (conn) => conn.close())
+  .build();
+
+const cache = r
+  .resource("app.cache")
+  .dependencies({ config }) // ← Also depends on config
+  .init(async (_cfg, { config }) => {
+    return createRedisClient(config.redisUrl);
+  })
+  .build();
+
+const userRepo = r
+  .resource("app.repos.user")
+  .dependencies({ database, cache }) // ← Depends on db and cache
+  .init(async (_cfg, { database, cache }) => ({
+    async findById(id: string) {
+      const cached = await cache.get(`user:${id}`);
+      if (cached) return cached;
+      
+      const user = await database.users.findOne({ id });
+      await cache.set(`user:${id}`, user);
+      return user;
+    },
+  }))
+  .build();
+```
+
+Runner automatically:
+- Resolves the dependency graph topologically
+- Initializes resources in the correct order
+- Disposes resources in reverse order
+- Detects circular dependencies and fails fast
+
+## Task Dependencies
+
+Tasks can depend on resources, other tasks, events, and more:
+
+```typescript
+const emailService = r
+  .resource("app.services.email")
+  .init(async () => ({ send: async (to: string) => { /* ... */ } }))
+  .build();
+
+const userCreated = r
+  .event("app.events.userCreated")
+  .payloadSchema<{ userId: string; email: string }>({ parse: (v) => v })
+  .build();
+
+const createUser = r
+  .task("users.create")
+  .dependencies({
+    db: database,
+    logger,
+    emitUserCreated: userCreated, // ← Inject event emitter
+  })
+  .run(async (input, { db, logger, emitUserCreated }) => {
+    const user = await db.users.insert(input);
+    await emitUserCreated({ userId: user.id, email: user.email });
+    await logger.info("User created", { userId: user.id });
+    return user;
+  })
+  .build();
+
+const sendWelcomeEmail = r
+  .task("users.sendWelcome")
+  .dependencies({ emailService })
+  .run(async (input: { email: string }, { emailService }) => {
+    await emailService.send(input.email);
+  })
+  .build();
+
+// Tasks can depend on other tasks
+const registerUser = r
+  .task("users.register")
+  .dependencies({ createUser, sendWelcomeEmail })
+  .run(async (input, { createUser, sendWelcomeEmail }) => {
+    const user = await createUser(input);
+    await sendWelcomeEmail({ email: user.email });
+    return user;
+  })
+  .build();
+```
+
+## Middleware Dependencies
+
+Middleware can also inject dependencies:
+
+```typescript
+const authService = r
+  .resource("app.services.auth")
+  .init(async () => ({
+    validateToken: async (token: string) => { /* ... */ },
+  }))
+  .build();
+
+const authMiddleware = r.middleware
+  .task("app.middleware.auth")
+  .dependencies({ authService }) // ← Middleware can have dependencies
+  .run(async ({ next, task }, { authService }) => {
+    const token = task.input.authorization;
+    const user = await authService.validateToken(token);
+    return next({ ...task.input, user });
+  })
+  .build();
+
+const protectedTask = r
+  .task("users.update")
+  .middleware([authMiddleware])
+  .run(async (input) => {
+    // input.user is guaranteed to exist
+  })
+  .build();
+```
+
+## Optional Dependencies
+
+Mark dependencies as optional to support graceful degradation:
+
+```typescript
+const analyticsService = r
+  .resource("app.services.analytics")
+  .init(async () => createAnalytics())
+  .build();
+
+const createUser = r
+  .task("users.create")
+  .dependencies({
+    db: database,
+    analytics: analyticsService.optional(), // ← Optional dependency
+  })
+  .run(async (input, { db, analytics }) => {
+    const user = await db.users.insert(input);
+    
+    // Check if analytics is available
+    if (analytics) {
+      await analytics.track("user.created", { userId: user.id });
+    }
+    
+    return user;
+  })
+  .build();
+
+// Register without analytics - task still works
+const app = r
+  .resource("app")
+  .register([database, createUser]) // analytics not registered
+  .build();
+```
+
+## Dependency Configuration
+
+Resources can be configured when registered:
+
+```typescript
+const emailer = r
+  .resource<{ smtpUrl: string; from: string }>("app.emailer")
+  .init(async (config) => ({
+    send: async (to: string, subject: string, body: string) => {
+      // Use config.smtpUrl and config.from
+    },
+  }))
+  .build();
+
+// Configure when registering
+const app = r
+  .resource("app")
+  .register([
+    emailer.with({
+      smtpUrl: process.env.SMTP_URL!,
+      from: "noreply@myapp.com",
+    }),
+  ])
+  .build();
+```
+
+## Built-in Global Dependencies
+
+Runner provides commonly-used resources out of the box:
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+const myTask = r
+  .task("myTask")
+  .dependencies({
+    logger: globals.resources.logger,       // Built-in logger
+    runtime: globals.resources.runtime,     // Runtime control
+    store: globals.resources.store,         // Component store
+    cache: globals.resources.cache,         // LRU cache
+    queue: globals.resources.queue,         // Sequential queue
+    semaphore: globals.resources.semaphore, // Concurrency control
+  })
+  .run(async (input, deps) => {
+    await deps.logger.info("Task started");
+    // Use other globals...
+  })
+  .build();
+```
+
+## Testing with Dependency Injection
+
+DI makes testing straightforward:
+
+```typescript
+// Unit test: call .run() directly with mocks
+test("createUser", async () => {
+  const mockDb = {
+    users: {
+      insert: vi.fn().mockResolvedValue({ id: "123", name: "Ada" }),
+    },
+  };
+  
+  const mockLogger = {
+    info: vi.fn(),
+  };
+  
+  const result = await createUser.run(
+    { name: "Ada", email: "ada@example.com" },
+    { db: mockDb, logger: mockLogger }
+  );
+  
+  expect(result.id).toBe("123");
+  expect(mockLogger.info).toHaveBeenCalled();
+});
+
+// Integration test: use real dependencies
+test("createUser integration", async () => {
+  const testDb = await createTestDatabase();
+  const { runTask, dispose } = await run(app);
+  
+  const result = await runTask(createUser, {
+    name: "Ada",
+    email: "ada@example.com",
+  });
+  
+  expect(result.id).toBeDefined();
+  await dispose();
+});
+```
+
+## Type Extraction
+
+Extract dependency types for reuse:
+
+```typescript
+import type { ExtractResourceValue } from "@bluelibs/runner";
+
+type DatabaseType = ExtractResourceValue<typeof database>;
+type LoggerType = ExtractResourceValue<typeof logger>;
+
+// Use in function signatures
+function setupService(db: DatabaseType, logger: LoggerType) {
+  // Implementation
+}
+```
+
+## Dependency Graph Visualization
+
+Runner Dev Tools provides visual dependency graphs:
+
+```bash
+npm install -g @bluelibs/runner-dev
+runner-dev overview --details 10
+```
+
+See [Runner Dev Tools](/tools/runner-dev) for more.
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Keep Dependencies Minimal" icon="minimize">
+    Only inject what a task actually needs—don't over-inject
+  </Card>
+  
+  <Card title="Use Interfaces" icon="shapes">
+    Depend on interfaces/types, not concrete implementations
+  </Card>
+  
+  <Card title="Avoid God Objects" icon="ban">
+    Don't create resources that do everything—keep them focused
+  </Card>
+  
+  <Card title="Test with Mocks" icon="flask">
+    Use `.run()` with mocks for fast unit tests
+  </Card>
+</CardGroup>
+
+## See Also
+
+- [Resources](/concepts/resources) - Singleton lifecycle management
+- [Tasks](/concepts/tasks) - Business logic with DI
+- [Overrides](/advanced/overrides) - Replace dependencies for testing
+- [Testing](/testing/overview) - Unit and integration test patterns

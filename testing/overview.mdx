@@ -1,0 +1,251 @@
+---
+title: Testing Overview
+description: Learn BlueLibs Runner's testing philosophy and strategies for fast, isolated tests
+---
+
+Runner's explicit dependency injection makes testing straightforward. You have two testing strategies: call `.run()` directly with mocks for fast unit tests, or spin up the full runtime when you need middleware and lifecycle behavior.
+
+## Testing Philosophy
+
+Runner's testing approach is built on three principles:
+
+1. **Explicit over implicit** - Dependencies are injected as plain objects, making mocking trivial
+2. **No framework ceremonies** - Call tasks directly in tests; no special test harnesses required
+3. **Test what matters** - Unit test business logic with mocks, integration test with real dependencies
+
+## Two Testing Strategies
+
+| Approach | Speed | What runs | Best for |
+|----------|-------|-----------|----------|
+| **Unit test** | Fast | Just your function | Logic, edge cases |
+| **Integration test** | Slower | Full pipeline | End-to-end flows, wiring |
+
+### When to Use Each
+
+**Unit tests** (calling `.run()` directly):
+- Testing business logic in isolation
+- Edge cases and error handling
+- Fast feedback during development
+- Bypasses middleware, events, and lifecycle
+
+**Integration tests** (using `run()` with overrides):
+- Testing the full flow including middleware
+- Verifying event emissions and hook execution
+- Testing with real infrastructure (in-memory DBs, test servers)
+- Ensuring components wire together correctly
+
+## Test Isolation
+
+Every `run()` call creates a **completely isolated container**:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+const myTask = r.task("app.task").run(async () => "result").build();
+const app = r.resource("app").register([myTask]).build();
+
+// Two isolated runtimes - no shared state
+const runtime1 = await run(app);
+const runtime2 = await run(app);
+
+// Both can run in parallel
+const [result1, result2] = await Promise.all([
+  runtime1.runTask(myTask),
+  runtime2.runTask(myTask),
+]);
+
+await runtime1.dispose();
+await runtime2.dispose();
+```
+
+**Why this matters:**
+- Tests can run in parallel without interference
+- Each test gets fresh resources
+- No cleanup between tests needed (beyond `dispose()`)
+
+## Running Tests
+
+### Basic Test Structure
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+describe("My feature", () => {
+  it("works correctly", async () => {
+    // Define your components
+    const myTask = r.task("test.task")
+      .run(async (input: string) => input.toUpperCase())
+      .build();
+    
+    const app = r.resource("app").register([myTask]).build();
+    
+    // Start runtime
+    const { runTask, dispose } = await run(app);
+    
+    try {
+      // Execute test
+      const result = await runTask(myTask, "hello");
+      expect(result).toBe("HELLO");
+    } finally {
+      // Always clean up
+      await dispose();
+    }
+  });
+});
+```
+
+### Always Dispose
+
+Resources hold connections, timers, and listeners. **Always** call `dispose()` to prevent:
+- Memory leaks
+- Port conflicts
+- Hanging test processes
+- Flaky tests
+
+```typescript
+// Use try/finally to ensure cleanup
+const { dispose } = await run(app);
+try {
+  // ... your tests
+} finally {
+  await dispose(); // Even if test fails
+}
+```
+
+## Debug Mode in Tests
+
+By default, logs are suppressed when `NODE_ENV=test`. Enable them for debugging:
+
+```typescript
+// Normal debug output
+await run(app, { debug: "normal" });
+
+// Verbose debug with inputs/outputs
+await run(app, { debug: "verbose" });
+
+// Custom log level
+await run(app, { 
+  debug: "verbose",
+  logs: { printThreshold: "debug" } 
+});
+```
+
+**Debug levels:**
+
+| Level | What's logged |
+|-------|---------------|
+| `"normal"` | Lifecycle events, errors, event emissions |
+| `"verbose"` | All of above + task inputs/outputs, resource configs |
+
+## Test Patterns
+
+### Testing with Mock Dependencies
+
+```typescript
+const emailService = r.resource("app.emailService")
+  .init(async () => ({ send: async (to: string) => console.log(to) }))
+  .build();
+
+const notifyUser = r.task("app.notifyUser")
+  .dependencies({ emailService })
+  .run(async (email: string, { emailService }) => {
+    await emailService.send(email);
+    return { sent: true };
+  })
+  .build();
+
+// Unit test - call .run() directly
+it("sends email", async () => {
+  const mockService = { send: jest.fn() };
+  
+  await notifyUser.run("user@example.com", {
+    emailService: mockService,
+  });
+  
+  expect(mockService.send).toHaveBeenCalledWith("user@example.com");
+});
+```
+
+### Type-Safe Test Inputs
+
+```typescript
+// Define task with schema
+const createUser = r.task("users.create")
+  .inputSchema(z.object({ 
+    name: z.string(), 
+    email: z.string().email() 
+  }))
+  .run(async (input) => ({ id: "123", ...input }))
+  .build();
+
+const app = r.resource("app").register([createUser]).build();
+const { runTask } = await run(app);
+
+// TypeScript enforces correct input shape
+await runTask(createUser, { 
+  name: "Ada", 
+  email: "ada@example.com" 
+}); // ✓ Type-safe
+
+// @ts-expect-error - missing required fields
+await runTask(createUser, { name: "Bob" }); // ✗ Compile error
+```
+
+## Testing Tips
+
+### Prefer Task References Over String IDs
+
+```typescript
+// Good - type-safe, autocomplete works
+await runTask(createUser, { name: "Alice", email: "alice@test.com" });
+
+// Works but no type checking
+await runTask("app.tasks.createUser", { 
+  name: "Alice", 
+  email: "alice@test.com" 
+});
+```
+
+### Test Registration Errors Early
+
+Use `dryRun` to validate wiring without starting resources:
+
+```typescript
+it("app wiring is valid", async () => {
+  await expect(run(app, { dryRun: true })).resolves.toBeDefined();
+});
+```
+
+### Isolate Slow Resources
+
+Create test-specific overrides for expensive resources:
+
+```typescript
+import { override } from "@bluelibs/runner";
+
+// Production database (slow)
+const database = r.resource("app.db")
+  .init(async () => connectToPostgres())
+  .build();
+
+// Test override (fast)
+const testDb = override(database, {
+  init: async () => new InMemoryDatabase()
+});
+
+const testApp = r.resource("test")
+  .register([database, /* other components */])
+  .overrides([testDb])
+  .build();
+```
+
+## Next Steps
+
+- **[Test Resources](/testing/test-resources)** - Learn about `createTestResource` helper and test runtime utilities
+- **[Mocking](/testing/mocking)** - Deep dive into mocking dependencies and using overrides
+
+<Note>
+**Testing with createTestResource (deprecated)**
+
+Runner provides `createTestResource()` helper, but it's deprecated in favor of calling `run()` directly. The direct approach is more flexible and has better type safety. See [Test Resources](/testing/test-resources) for details.
+</Note>

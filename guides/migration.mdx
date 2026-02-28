@@ -1,0 +1,563 @@
+---
+title: Migration Guide
+description: Upgrading between BlueLibs Runner versions
+---
+
+This guide covers upgrading between Runner versions, handling breaking changes, and migrating from other frameworks.
+
+## Current Version Support
+
+| Version | Status | Support Level | End of Life |
+|---------|--------|---------------|-------------|
+| 5.x | Current | Full support (new features, bug fixes, security) | TBD |
+| 4.x | Maintenance | Critical fixes and security only | TBD |
+| 3.x | End of life | No support | Past |
+
+<Note>
+  Always review [GitHub Releases](https://github.com/bluelibs/runner/releases) before upgrading for detailed changelog and breaking changes.
+</Note>
+
+## Semantic Versioning
+
+Runner follows strict semantic versioning:
+
+- **Patch** (5.0.1 → 5.0.2): Bug fixes, security patches, no breaking changes
+- **Minor** (5.0.0 → 5.1.0): New features, backward-compatible improvements
+- **Major** (5.0.0 → 6.0.0): Breaking changes, planned migrations
+
+## Upgrade Process
+
+### General Steps
+
+<Steps>
+  <Step title="Check current version">
+    ```bash
+    npm ls @bluelibs/runner
+    # or
+    cat package.json | grep @bluelibs/runner
+    ```
+  </Step>
+
+  <Step title="Review release notes">
+    Read the [GitHub Releases](https://github.com/bluelibs/runner/releases) for your target version. Look for:
+    - Breaking changes
+    - Deprecation warnings
+    - Migration guides
+    - New features
+  </Step>
+
+  <Step title="Update dependencies">
+    ```bash
+    npm install @bluelibs/runner@latest
+    # or specific version
+    npm install @bluelibs/runner@5.2.0
+    ```
+  </Step>
+
+  <Step title="Run type check">
+    ```bash
+    npx tsc --noEmit
+    ```
+
+    TypeScript errors often reveal breaking changes that need attention.
+  </Step>
+
+  <Step title="Run tests">
+    ```bash
+    npm run test
+    # or full QA suite
+    npm run qa
+    ```
+  </Step>
+
+  <Step title="Test in staging">
+    Deploy to staging environment and run integration tests. Monitor for 24 hours before production deployment.
+  </Step>
+
+  <Step title="Production deployment">
+    Use your standard deployment process (canary, blue-green, etc.) with rollback plan ready.
+  </Step>
+</Steps>
+
+## Deprecation Lifecycle
+
+When a public API is deprecated, Runner follows this lifecycle:
+
+| Stage | Timeline | What Happens | Code Still Works? |
+|-------|----------|--------------|-------------------|
+| **Announced** | Minor release | Release note + docs note with replacement path | ✅ Yes |
+| **Warned** | Next minor | Deprecated marker in docs/types + migration guide | ✅ Yes |
+| **Removed** | Next major | Removed with migration notes in release notes | ❌ No |
+
+<Warning>
+  Behavior changes without breaking types (e.g., default value changes) are documented in release notes and may occur in minor versions.
+</Warning>
+
+## Version-Specific Migration
+
+### Migrating from 4.x to 5.x
+
+<Note>
+  This section will be updated with specific breaking changes when they occur. Check release notes for details.
+</Note>
+
+**Key changes in 5.x:**
+
+1. **Fluent builders become default**
+   
+   The `r.task()`, `r.resource()` builder API is now the recommended approach. Classic `task()`, `resource()` functions still work but are considered legacy.
+
+   ```typescript
+   // Old (still works)
+   import { task, resource } from "@bluelibs/runner";
+   const myTask = task({ id: "app.task", run: async (input) => {} });
+
+   // New (recommended)
+   import { r } from "@bluelibs/runner";
+   const myTask = r.task("app.task").run(async (input) => {}).build();
+   ```
+
+2. **Platform detection improvements**
+   
+   Edge worker detection is more robust. If you were using custom platform detection, review the new `detectEnvironment()` logic.
+
+3. **Visibility boundaries (`.exports()`)**
+   
+   Resources can now declare explicit exports. This is opt-in; existing code without `.exports()` continues to work with everything public.
+
+   ```typescript
+   const billing = r
+     .resource("billing")
+     .register([internalTask, publicTask])
+     .exports([publicTask]) // Only publicTask is visible outside
+     .build();
+   ```
+
+### Migrating from 3.x to 4.x
+
+<Note>
+  4.x is now in maintenance mode. If you're on 3.x, we recommend upgrading directly to 5.x.
+</Note>
+
+## Breaking Changes by Category
+
+### Type System Changes
+
+When type inference changes in breaking ways:
+
+```typescript
+// Problem: Circular type inference fails
+const resource1 = r.resource("a").dependencies({ resource2 }).build();
+const resource2 = r.resource("b").dependencies({ resource1 }).build();
+// TypeScript shows 'any' or fails to infer
+
+// Solution: Explicit type annotation
+import type { IResource } from "@bluelibs/runner";
+
+const resource1 = r
+  .resource("a")
+  .dependencies({ resource2 })
+  .build() as IResource<void, { value: string }>;
+```
+
+See [Handling Circular Dependencies](/advanced/dependency-injection#circular-dependencies) for full patterns.
+
+### Runtime Behavior Changes
+
+When default behaviors change:
+
+| Change | Version | Migration |
+|--------|---------|----------|
+| Event cycle detection enabled by default | 5.0.0 | Disable with `run(app, { runtimeEventCycleDetection: false })` if needed |
+| Error boundary enabled by default | 5.0.0 | Disable with `run(app, { errorBoundary: false })` if needed |
+
+### API Removals
+
+When APIs are removed in major versions:
+
+```typescript
+// Removed in 5.0.0: Old task definition syntax
+// This no longer works:
+const oldTask = task({ 
+  id: "app.task",
+  runner: async (input) => {} // 'runner' renamed to 'run'
+});
+
+// New syntax:
+const newTask = r
+  .task("app.task")
+  .run(async (input) => {})
+  .build();
+```
+
+## Migrating from Other Frameworks
+
+### From NestJS
+
+<AccordionGroup>
+  <Accordion title="Service → Resource">
+    NestJS services become Runner resources:
+
+    ```typescript
+    // NestJS
+    @Injectable()
+    export class DatabaseService {
+      private client: Client;
+      
+      async onModuleInit() {
+        this.client = await connect();
+      }
+      
+      async onModuleDestroy() {
+        await this.client.close();
+      }
+    }
+
+    // Runner
+    const database = r
+      .resource("app.db")
+      .init(async () => {
+        const client = await connect();
+        return client;
+      })
+      .dispose(async (client) => {
+        await client.close();
+      })
+      .build();
+    ```
+  </Accordion>
+
+  <Accordion title="Controller → Task + HTTP Server">
+    NestJS controllers become Runner tasks + Express/Fastify:
+
+    ```typescript
+    // NestJS
+    @Controller('users')
+    export class UsersController {
+      constructor(private db: DatabaseService) {}
+      
+      @Post()
+      async create(@Body() dto: CreateUserDto) {
+        return this.db.users.insert(dto);
+      }
+    }
+
+    // Runner
+    const createUser = r
+      .task("users.create")
+      .dependencies({ db: database })
+      .inputSchema(CreateUserSchema)
+      .run(async (input, { db }) => {
+        return db.users.insert(input);
+      })
+      .build();
+
+    const server = r
+      .resource("app.server")
+      .dependencies({ createUser })
+      .init(async (_, { createUser }) => {
+        const app = express();
+        app.post('/users', async (req, res) => {
+          const user = await createUser.run(req.body, {});
+          res.json(user);
+        });
+        return app.listen(3000);
+      })
+      .build();
+    ```
+  </Accordion>
+
+  <Accordion title="Guard/Interceptor → Middleware">
+    NestJS guards and interceptors become Runner middleware:
+
+    ```typescript
+    // NestJS
+    @UseGuards(AuthGuard)
+    @UseInterceptors(LoggingInterceptor)
+    async someMethod() {}
+
+    // Runner
+    const someTask = r
+      .task("app.task")
+      .middleware([authMiddleware, loggingMiddleware])
+      .run(async (input) => {})
+      .build();
+    ```
+  </Accordion>
+
+  <Accordion title="EventEmitter → Events">
+    NestJS event emitter becomes Runner events:
+
+    ```typescript
+    // NestJS
+    @Injectable()
+    export class OrdersService {
+      constructor(private events: EventEmitter2) {}
+      
+      async create(order) {
+        const created = await this.db.orders.insert(order);
+        this.events.emit('order.created', created);
+      }
+    }
+
+    @OnEvent('order.created')
+    handleOrderCreated(order) {}
+
+    // Runner
+    const orderCreated = r
+      .event("orders.created")
+      .payloadSchema<Order>({ parse: (v) => v })
+      .build();
+
+    const createOrder = r
+      .task("orders.create")
+      .dependencies({ db, orderCreated })
+      .run(async (input, { db, orderCreated }) => {
+        const order = await db.orders.insert(input);
+        await orderCreated(order);
+        return order;
+      })
+      .build();
+
+    const handleOrderCreated = r
+      .hook("orders.onCreated")
+      .on(orderCreated)
+      .run(async (event) => {
+        // Handle event
+      })
+      .build();
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### From Express/Plain Node.js
+
+<AccordionGroup>
+  <Accordion title="Express app → Runner app with server resource">
+    ```typescript
+    // Before: Plain Express
+    const app = express();
+    const db = await connectDB();
+
+    app.post('/users', async (req, res) => {
+      const user = await db.users.insert(req.body);
+      res.json(user);
+    });
+
+    app.listen(3000);
+
+    // After: Runner + Express
+    const db = r
+      .resource("app.db")
+      .init(async () => await connectDB())
+      .build();
+
+    const createUser = r
+      .task("users.create")
+      .dependencies({ db })
+      .run(async (input, { db }) => {
+        return db.users.insert(input);
+      })
+      .build();
+
+    const server = r
+      .resource("app.server")
+      .dependencies({ db, createUser })
+      .init(async (_, { db, createUser }) => {
+        const app = express();
+        app.post('/users', async (req, res) => {
+          const user = await createUser.run(req.body, {});
+          res.json(user);
+        });
+        return app.listen(3000);
+      })
+      .build();
+
+    const app = r
+      .resource("app")
+      .register([db, createUser, server])
+      .build();
+
+    await run(app);
+    ```
+  </Accordion>
+
+  <Accordion title="Shared modules → Resources">
+    ```typescript
+    // Before: Shared singleton
+    let dbConnection;
+    export async function getDB() {
+      if (!dbConnection) {
+        dbConnection = await connect();
+      }
+      return dbConnection;
+    }
+
+    // After: Resource
+    const db = r
+      .resource("app.db")
+      .init(async () => await connect())
+      .dispose(async (conn) => await conn.close())
+      .build();
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Common Migration Issues
+
+<AccordionGroup>
+  <Accordion title="Forgot .build()" icon="exclamation">
+    **Problem:**
+    ```typescript
+    const myTask = r.task("app.task").run(async () => {});
+    // TypeError: myTask is not a function
+    ```
+
+    **Solution:**
+    ```typescript
+    const myTask = r.task("app.task").run(async () => {}).build();
+    ```
+  </Accordion>
+
+  <Accordion title="Missing registration" icon="exclamation">
+    **Problem:**
+    ```typescript
+    const task = r.task("app.task").dependencies({ db }).build();
+    const app = r.resource("app").register([task]).build();
+    // Runtime error: Resource "app.db" not found
+    ```
+
+    **Solution:**
+    ```typescript
+    const app = r.resource("app").register([db, task]).build();
+    ```
+  </Accordion>
+
+  <Accordion title="Type errors after upgrade" icon="exclamation">
+    **Problem:**
+    ```typescript
+    // TypeScript complains about task input types after upgrade
+    ```
+
+    **Solution:**
+    - Run `npm run test` to identify failing tests
+    - Check release notes for type system changes
+    - Use explicit type annotations if needed
+    - Update `inputSchema` and `resultSchema` if validation changed
+  </Accordion>
+
+  <Accordion title="Circular dependencies" icon="exclamation">
+    **Problem:**
+    ```typescript
+    // TypeScript shows 'any' or circular reference errors
+    ```
+
+    **Solution:**
+    See [Handling Circular Dependencies](/advanced/dependency-injection#circular-dependencies) for patterns using explicit types and dependency injection.
+  </Accordion>
+</AccordionGroup>
+
+## Testing After Migration
+
+<Steps>
+  <Step title="Unit tests">
+    Ensure all unit tests pass:
+    ```bash
+    npm run test
+    ```
+  </Step>
+
+  <Step title="Integration tests">
+    Run full integration suite:
+    ```bash
+    npm run test:integration
+    ```
+  </Step>
+
+  <Step title="Type checking">
+    Verify type safety:
+    ```bash
+    npx tsc --noEmit
+    ```
+  </Step>
+
+  <Step title="Lint">
+    Check for deprecation warnings:
+    ```bash
+    npm run lint
+    ```
+  </Step>
+
+  <Step title="Manual testing">
+    Test critical flows manually in staging:
+    - User registration/login
+    - Payment processing
+    - Core business operations
+  </Step>
+
+  <Step title="Performance testing">
+    Run load tests to ensure no performance regressions:
+    ```bash
+    npm run bench
+    ```
+  </Step>
+</Steps>
+
+## Rollback Plan
+
+If the migration fails in production:
+
+<Steps>
+  <Step title="Immediate rollback">
+    ```bash
+    # Revert to previous version
+    npm install @bluelibs/runner@4.x.x
+    
+    # Or use git
+    git revert HEAD
+    git push
+    ```
+  </Step>
+
+  <Step title="Redeploy">
+    Use your deployment process to redeploy the previous version:
+    ```bash
+    kubectl rollout undo deployment/my-app
+    # or
+    pm2 reload my-app
+    ```
+  </Step>
+
+  <Step title="Investigate">
+    - Review logs for errors
+    - Check metrics for anomalies
+    - Identify root cause
+    - Fix in staging before retrying
+  </Step>
+</Steps>
+
+## Support During Migration
+
+Need help migrating? We're here to help:
+
+<CardGroup cols={2}>
+  <Card title="GitHub Issues" icon="github" href="https://github.com/bluelibs/runner/issues">
+    Ask questions and report migration issues
+  </Card>
+  <Card title="Enterprise Support" icon="building" href="/guides/production-readiness">
+    Get dedicated migration assistance
+  </Card>
+  <Card title="Release Notes" icon="newspaper" href="https://github.com/bluelibs/runner/releases">
+    Read detailed changelogs
+  </Card>
+  <Card title="Examples" icon="code" href="https://github.com/bluelibs/runner/tree/main/examples">
+    Reference working examples
+  </Card>
+</CardGroup>
+
+## Additional Resources
+
+- [GitHub Releases](https://github.com/bluelibs/runner/releases) - Detailed changelogs
+- [Enterprise Policy](/guides/production-readiness) - Support windows and SLAs
+- [Troubleshooting Guide](/guides/troubleshooting) - Common issues
+- [Production Readiness](/guides/production-readiness) - Pre-deployment checks

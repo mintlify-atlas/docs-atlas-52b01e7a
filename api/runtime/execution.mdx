@@ -1,0 +1,447 @@
+---
+title: "Execution Context"
+description: "Execution journal and per-execution state management"
+---
+
+## Overview
+
+The execution context provides a way to share state and communicate between middleware, tasks, and hooks within a single execution. The primary mechanism is the **execution journal**, which acts as a typed key-value store for middleware coordination.
+
+```typescript
+import { journal } from "@bluelibs/runner";
+
+// Create a journal key
+const abortControllerKey = journal.createKey<AbortController>("timeout.abortController");
+
+// In middleware: store value
+const controller = new AbortController();
+journal.set(abortControllerKey, controller);
+
+// In task: retrieve value
+const controller = journal.get(abortControllerKey);
+if (controller) {
+  // Use the abort controller
+}
+```
+
+## Execution Journal
+
+The execution journal is created per task execution and passed through the middleware chain. It allows middleware to:
+- Store intermediate state
+- Communicate with tasks
+- Share data between middleware layers
+
+### Creating Journal Keys
+
+Create typed keys for storing values in the journal:
+
+```typescript
+journal.createKey<T>(id: string): JournalKey<T>
+```
+
+<ParamField path="id" type="string" required>
+  Unique identifier for the journal key.
+  
+  ```typescript
+  const retryCountKey = journal.createKey<number>("middleware.retry.count");
+  const timestampKey = journal.createKey<Date>("middleware.timestamp");
+  const abortKey = journal.createKey<AbortController>("middleware.abort");
+  ```
+</ParamField>
+
+<ResponseField name="key" type="JournalKey<T>">
+  A typed journal key for storing and retrieving values.
+</ResponseField>
+
+### Storing Values
+
+Store a value in the journal:
+
+```typescript
+journal.set<T>(
+  key: JournalKey<T>,
+  value: T,
+  options?: { override?: boolean }
+): void
+```
+
+<ParamField path="key" type="JournalKey<T>" required>
+  The journal key to store the value under.
+</ParamField>
+
+<ParamField path="value" type="T" required>
+  The value to store.
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, allows overwriting existing value. When `false`, throws if key already exists.
+</ParamField>
+
+**Example:**
+
+```typescript
+const timestampKey = journal.createKey<Date>("timestamp");
+journal.set(timestampKey, new Date());
+
+// Overwrite existing value
+journal.set(timestampKey, new Date(), { override: true });
+```
+
+**Throws:** `RuntimeError` if key already exists and `override` is false
+
+### Retrieving Values
+
+Retrieve a value from the journal:
+
+```typescript
+journal.get<T>(key: JournalKey<T>): T | undefined
+```
+
+<ParamField path="key" type="JournalKey<T>" required>
+  The journal key to retrieve the value for.
+</ParamField>
+
+<ResponseField name="value" type="T | undefined">
+  The stored value, or `undefined` if not present.
+</ResponseField>
+
+**Example:**
+
+```typescript
+const value = journal.get(timestampKey);
+if (value) {
+  console.log("Timestamp:", value);
+}
+```
+
+### Checking Existence
+
+Check if a key exists in the journal:
+
+```typescript
+journal.has<T>(key: JournalKey<T>): boolean
+```
+
+**Example:**
+
+```typescript
+if (journal.has(abortControllerKey)) {
+  const controller = journal.get(abortControllerKey)!;
+  controller.abort();
+}
+```
+
+### Creating Custom Journal
+
+Create a new journal instance:
+
+```typescript
+journal.create(): ExecutionJournal
+```
+
+Useful when you need to pass a specific journal to `runTask()`:
+
+```typescript
+const customJournal = journal.create();
+customJournal.set(someKey, someValue);
+
+await runtime.runTask(myTask, input, { journal: customJournal });
+```
+
+## Type Information
+
+```typescript
+export interface ExecutionJournal {
+  set<T>(key: JournalKey<T>, value: T, options?: { override?: boolean }): void;
+  get<T>(key: JournalKey<T>): T | undefined;
+  has<T>(key: JournalKey<T>): boolean;
+}
+
+export interface JournalKey<T> {
+  id: string;
+  _type?: T; // Phantom type for TypeScript inference
+}
+
+export const journal: {
+  createKey<T>(id: string): JournalKey<T>;
+  create(): ExecutionJournal;
+};
+```
+
+## Usage Patterns
+
+### Middleware Communication
+
+Middleware can store state that tasks can read:
+
+```typescript
+import { journal } from "@bluelibs/runner";
+
+// Define journal keys
+const abortControllerKey = journal.createKey<AbortController>("timeout.abortController");
+const startTimeKey = journal.createKey<number>("timing.start");
+
+// Timeout middleware
+const timeoutMiddleware = r.middleware.task("timeout")
+  .configSchema<{ ms: number }>({ parse: (v) => v })
+  .run(async ({ config, next, journal }) => {
+    const controller = new AbortController();
+    journal.set(abortControllerKey, controller);
+    
+    const timeoutId = setTimeout(() => controller.abort(), config.ms);
+    
+    try {
+      return await next();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  })
+  .build();
+
+// Task that uses the abort controller
+const fetchData = r.task("fetchData")
+  .middleware([timeoutMiddleware.with({ ms: 5000 })])
+  .run(async ({ journal }) => {
+    const controller = journal.get(abortControllerKey);
+    
+    const response = await fetch('https://api.example.com/data', {
+      signal: controller?.signal,
+    });
+    
+    return await response.json();
+  })
+  .build();
+```
+
+### Timing and Metrics
+
+```typescript
+const timingMiddleware = r.middleware.task("timing")
+  .run(async ({ task, next, journal, logger }) => {
+    const startTime = Date.now();
+    journal.set(startTimeKey, startTime);
+    
+    try {
+      const result = await next();
+      const duration = Date.now() - startTime;
+      await logger.info(`${task.id} completed in ${duration}ms`);
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      await logger.error(`${task.id} failed after ${duration}ms`);
+      throw error;
+    }
+  })
+  .build();
+```
+
+### Retry State
+
+```typescript
+const retryCountKey = journal.createKey<number>("retry.count");
+const retryErrorsKey = journal.createKey<Error[]>("retry.errors");
+
+const retryMiddleware = r.middleware.task("retry")
+  .configSchema<{ maxAttempts: number }>({ parse: (v) => v })
+  .run(async ({ config, next, journal }) => {
+    const errors: Error[] = [];
+    
+    for (let attempt = 1; attempt <= config.maxAttempts; attempt++) {
+      journal.set(retryCountKey, attempt, { override: true });
+      
+      try {
+        return await next();
+      } catch (error) {
+        errors.push(error as Error);
+        journal.set(retryErrorsKey, errors, { override: true });
+        
+        if (attempt === config.maxAttempts) {
+          throw error;
+        }
+      }
+    }
+    
+    throw new Error('Unreachable');
+  })
+  .build();
+
+// Task can inspect retry state
+const task = r.task("myTask")
+  .middleware([retryMiddleware.with({ maxAttempts: 3 })])
+  .run(async ({ journal, logger }) => {
+    const attempt = journal.get(retryCountKey) ?? 1;
+    await logger.info(`Attempt ${attempt}`);
+    
+    // ... task logic
+  })
+  .build();
+```
+
+### Cache Keys
+
+```typescript
+const cacheKeyKey = journal.createKey<string>("cache.key");
+const cacheHitKey = journal.createKey<boolean>("cache.hit");
+
+const cacheMiddleware = r.middleware.task("cache")
+  .dependencies(() => ({ cache: cacheResource }))
+  .run(async ({ task, input, deps, next, journal }) => {
+    const cacheKey = `${task.id}:${JSON.stringify(input)}`;
+    journal.set(cacheKeyKey, cacheKey);
+    
+    const cached = await deps.cache.get(cacheKey);
+    if (cached) {
+      journal.set(cacheHitKey, true);
+      return cached;
+    }
+    
+    journal.set(cacheHitKey, false);
+    const result = await next();
+    await deps.cache.set(cacheKey, result);
+    return result;
+  })
+  .build();
+
+// Task can check if result was cached
+const task = r.task("myTask")
+  .middleware([cacheMiddleware])
+  .run(async ({ journal, logger }) => {
+    const wasHit = journal.get(cacheHitKey);
+    await logger.info(wasHit ? 'Cache hit' : 'Cache miss');
+    
+    // ... task logic
+  })
+  .build();
+```
+
+### Circuit Breaker State
+
+```typescript
+const circuitStateKey = journal.createKey<'open' | 'closed' | 'half-open'>('circuit.state');
+
+const circuitBreaker = r.middleware.task("circuitBreaker")
+  .run(async ({ next, journal, logger }) => {
+    const state = getCircuitState(); // From circuit breaker resource
+    journal.set(circuitStateKey, state);
+    
+    if (state === 'open') {
+      throw new Error('Circuit breaker is open');
+    }
+    
+    try {
+      const result = await next();
+      recordSuccess();
+      return result;
+    } catch (error) {
+      recordFailure();
+      throw error;
+    }
+  })
+  .build();
+```
+
+## Global Middleware Journal Keys
+
+Built-in middleware expose their journal keys:
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+// Retry middleware keys
+const retryKeys = globals.middleware.task.retry.journalKeys;
+const attempt = journal.get(retryKeys.attemptNumber);
+
+// Cache middleware keys
+const cacheKeys = globals.middleware.task.cache.journalKeys;
+const wasHit = journal.get(cacheKeys.hit);
+
+// Timeout middleware keys
+const timeoutKeys = globals.middleware.task.timeout.journalKeys;
+const controller = journal.get(timeoutKeys.abortController);
+
+// Circuit breaker keys
+const cbKeys = globals.middleware.task.circuitBreaker.journalKeys;
+const state = journal.get(cbKeys.state);
+
+// Rate limit keys
+const rlKeys = globals.middleware.task.rateLimit.journalKeys;
+const remaining = journal.get(rlKeys.remaining);
+
+// Fallback keys
+const fbKeys = globals.middleware.task.fallback.journalKeys;
+const usedFallback = journal.get(fbKeys.usedFallback);
+```
+
+## Best Practices
+
+### 1. Use Descriptive Key IDs
+
+```typescript
+// Good
+const abortControllerKey = journal.createKey<AbortController>("middleware.timeout.abortController");
+
+// Avoid
+const key = journal.createKey<any>("key");
+```
+
+### 2. Type Your Keys
+
+```typescript
+// Good
+const countKey = journal.createKey<number>("retry.count");
+const count = journal.get(countKey); // number | undefined
+
+// Avoid
+const countKey = journal.createKey("retry.count"); // any
+```
+
+### 3. Check Existence Before Use
+
+```typescript
+// Good
+const controller = journal.get(abortControllerKey);
+if (controller) {
+  controller.abort();
+}
+
+// Or use has()
+if (journal.has(abortControllerKey)) {
+  const controller = journal.get(abortControllerKey)!;
+  controller.abort();
+}
+```
+
+### 4. Document Journal Keys
+
+Expose journal keys from your middleware:
+
+```typescript
+export const myMiddleware = r.middleware.task("myMiddleware")
+  .run(async ({ next, journal }) => {
+    journal.set(myMiddleware.journalKeys.state, 'active');
+    return await next();
+  })
+  .build();
+
+// Expose keys
+myMiddleware.journalKeys = {
+  state: journal.createKey<string>("myMiddleware.state"),
+};
+```
+
+### 5. Use Override When Updating
+
+```typescript
+// When you need to update a value
+for (let i = 0; i < attempts; i++) {
+  journal.set(attemptKey, i, { override: true });
+  // ...
+}
+```
+
+## Related
+
+- [Runtime API](/api/runtime/runtime)
+- [Middleware Builder](/api/builders/middleware)
+- [Global Middleware](/api/globals)
+- [Custom Middleware Guide](/middleware/custom)

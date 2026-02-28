@@ -1,0 +1,363 @@
+---
+title: Resources
+description: Singletons with init/dispose lifecycle management
+---
+
+## What Are Resources?
+
+Resources are the **long-lived parts of your application** — things like database connections, configuration, services, and caches. They **initialize once when your app starts** and **clean up when it shuts down**.
+
+Think of resources as the foundation your tasks build upon. They provide the infrastructure and services that tasks need to do their work.
+
+## Why Use Resources?
+
+Resources solve three critical problems:
+
+1. **Async construction**: Many services (databases, HTTP servers) need async initialization
+2. **Lifecycle management**: Resources handle startup and graceful shutdown automatically
+3. **Singleton pattern**: Ensure only one instance exists and share it across your app
+
+<Note>
+Resources initialize **once** per application run, not per task execution. This makes them perfect for expensive-to-create objects like database connections or HTTP clients.
+</Note>
+
+## Creating Your First Resource
+
+Here's a simple database connection resource:
+
+```typescript
+import { r } from "@bluelibs/runner";
+import { MongoClient } from "mongodb";
+
+const db = r
+  .resource("app.db")
+  .init(async () => {
+    const client = new MongoClient(process.env.DATABASE_URL);
+    await client.connect();
+    return client;
+  })
+  .dispose(async (client) => {
+    await client.close();
+  })
+  .build();
+```
+
+<Steps>
+  <Step title="Create the resource">
+    Use `r.resource(id)` with a unique namespaced ID like `"app.db"`.
+  </Step>
+  <Step title="Add initialization logic">
+    Call `.init(async () => { ... })` to define how the resource is created. This runs once at startup.
+  </Step>
+  <Step title="Add cleanup logic (optional)">
+    Call `.dispose(async (value) => { ... })` to clean up when the app shuts down.
+  </Step>
+  <Step title="Build it">
+    Call `.build()` to finalize the resource definition.
+  </Step>
+</Steps>
+
+## Resource Configuration
+
+Resources can accept configuration at registration time using `.with()`:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+type SMTPConfig = {
+  smtpUrl: string;
+  from: string;
+};
+
+const emailer = r
+  .resource<SMTPConfig>("app.emailer")
+  .init(async (config) => ({
+    send: async (to: string, subject: string, body: string) => {
+      console.log(`Sending email from ${config.from} via ${config.smtpUrl}`);
+      // Actual SMTP logic here
+    },
+  }))
+  .build();
+
+const app = r
+  .resource("app")
+  .register([
+    emailer.with({
+      smtpUrl: "smtp://localhost:1025",
+      from: "noreply@myapp.com",
+    }),
+  ])
+  .build();
+```
+
+<Tip>
+The config type parameter `<SMTPConfig>` makes `.with()` type-safe. TypeScript will enforce that you provide all required fields.
+</Tip>
+
+## Resources with Dependencies
+
+Resources can depend on other resources, creating a dependency graph that Runner initializes in the correct order:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const db = r
+  .resource("app.db")
+  .init(async () => ({ users: new Map() }))
+  .build();
+
+const userService = r
+  .resource("app.services.user")
+  .dependencies({ db, logger: globals.resources.logger })
+  .init(async (_config, { db, logger }) => {
+    await logger.info("Initializing user service");
+    return {
+      async createUser(data: { name: string; email: string }) {
+        const user = { id: Date.now().toString(), ...data };
+        db.users.set(user.id, user);
+        return user;
+      },
+      async getUser(id: string) {
+        return db.users.get(id);
+      },
+    };
+  })
+  .build();
+```
+
+<Note>
+Runner automatically resolves the dependency order. In this example, `db` initializes before `userService` because `userService` depends on it.
+</Note>
+
+## Lifecycle: Init and Dispose
+
+The resource lifecycle has two phases:
+
+### Init Phase
+
+Runs **once** when you call `run(app)`. This is where you:
+- Connect to databases
+- Start HTTP servers
+- Load configuration
+- Initialize caches
+
+```typescript
+const server = r
+  .resource<{ port: number }>("app.server")
+  .init(async ({ port }) => {
+    const app = express();
+    const listener = app.listen(port);
+    return { app, listener };
+  })
+  .build();
+```
+
+### Dispose Phase
+
+Runs when you call `dispose()` or when the process exits (if shutdown hooks are enabled). This is where you:
+- Close database connections
+- Stop HTTP servers
+- Flush logs
+- Clean up resources
+
+```typescript
+const server = r
+  .resource<{ port: number }>("app.server")
+  .init(async ({ port }) => {
+    const app = express();
+    const listener = app.listen(port);
+    return { app, listener };
+  })
+  .dispose(async ({ listener }) => {
+    return new Promise((resolve) => listener.close(resolve));
+  })
+  .build();
+```
+
+<Tip>
+**Graceful shutdown**: Runner calls `dispose()` in reverse dependency order, ensuring that dependents shut down before their dependencies.
+</Tip>
+
+## Resource Forking: Multiple Instances
+
+When you need **multiple instances** of the same resource type (e.g., connecting to multiple databases), use **forking**:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+// Define a reusable template
+const mailerBase = r
+  .resource<{ smtp: string }>("base.mailer")
+  .init(async (config) => ({
+    send: (to: string) => console.log(`Sending via ${config.smtp} to ${to}`),
+  }))
+  .build();
+
+// Fork with distinct identities
+export const transactionalMailer = mailerBase.fork("app.mailers.transactional");
+export const marketingMailer = mailerBase.fork("app.mailers.marketing");
+
+// Use forked resources as dependencies
+const orderService = r
+  .task("app.tasks.processOrder")
+  .dependencies({ mailer: transactionalMailer })
+  .run(async (input, { mailer }) => {
+    mailer.send(input.customerEmail);
+  })
+  .build();
+
+const app = r
+  .resource("app")
+  .register([
+    transactionalMailer.with({ smtp: "smtp.transactional.com" }),
+    marketingMailer.with({ smtp: "smtp.marketing.com" }),
+    orderService,
+  ])
+  .build();
+```
+
+<Note>
+**Fork vs Copy-Paste**: Forking lets you define the logic once and instantiate it multiple times with different configs. This keeps your code DRY and maintainable.
+</Note>
+
+## Conditional Registration
+
+Use **function-based registration** to conditionally include resources based on configuration:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const auditLog = r
+  .resource("app.audit")
+  .init(async () => ({ write: (msg: string) => console.log(msg) }))
+  .build();
+
+const feature = r
+  .resource<{ enableAudit: boolean }>("app.feature")
+  .register((config) => (config.enableAudit ? [auditLog] : []))
+  .init(async () => ({ enabled: true }))
+  .build();
+
+const app = r
+  .resource("app")
+  .register([feature.with({ enableAudit: true })])
+  .build();
+```
+
+This pattern is useful for:
+- **Feature flags**: Enable/disable features based on config
+- **Environment-specific resources**: Different resources for dev vs production
+- **Optional integrations**: Only load integrations when needed
+
+## Real-World Example: Authentication Service
+
+Here's a complete auth resource from the Fastify example:
+
+```typescript src/users/resources/auth.resource.ts
+import { r, globals } from "@bluelibs/runner";
+import { randomBytes, scrypt as _scrypt, timingSafeEqual } from "crypto";
+import { promisify } from "util";
+
+const scrypt = promisify(_scrypt);
+
+export interface AuthConfig {
+  secret?: string;
+  tokenExpiresInSeconds?: number;
+  cookieName?: string;
+}
+
+export const auth = r
+  .resource<AuthConfig>("users.resources.auth")
+  .meta({
+    title: "Authentication Service",
+    description: "JWT token-based authentication with password hashing",
+  })
+  .dependencies({
+    logger: globals.resources.logger,
+  })
+  .init(async (cfg, { logger }) => {
+    const secret = cfg.secret || "dev-secret-change-me";
+    const cookieName = cfg.cookieName || "auth";
+    const defaultExpiry = cfg.tokenExpiresInSeconds ?? 60 * 60 * 24 * 7; // 7 days
+
+    const hashPassword = async (password: string) => {
+      const salt = randomBytes(16).toString("hex");
+      const derived = (await scrypt(password, salt, 32)) as Buffer;
+      return { hash: derived.toString("hex"), salt };
+    };
+
+    const verifyPassword = async (
+      password: string,
+      hash: string,
+      salt: string
+    ) => {
+      if (!hash || !salt) return false;
+      const derived = (await scrypt(password, salt, 32)) as Buffer;
+      try {
+        return timingSafeEqual(Buffer.from(hash, "hex"), derived);
+      } catch {
+        return false;
+      }
+    };
+
+    const createSessionToken = (userId: string) => {
+      const exp = Math.floor(Date.now() / 1000) + defaultExpiry;
+      return signToken({ sub: userId, exp });
+    };
+
+    return {
+      hashPassword,
+      verifyPassword,
+      createSessionToken,
+      cookieName,
+    };
+  })
+  .build();
+```
+
+## Accessing Resource Values at Runtime
+
+Once your app is running, you can access resource values:
+
+```typescript
+const { getResourceValue, dispose } = await run(app);
+
+// Get a resource value
+const dbClient = getResourceValue(db);
+
+// Use it
+const users = await dbClient.collection("users").find().toArray();
+
+// Clean up when done
+await dispose();
+```
+
+<Tip>
+Use `getResourceValue()` sparingly in production code. It's mainly useful for debugging or one-off scripts. Prefer dependency injection in tasks and other resources.
+</Tip>
+
+## Best Practices
+
+<Steps>
+  <Step title="Use descriptive IDs">
+    Follow the pattern `domain.resources.name` (e.g., `"app.db"`, `"users.resources.auth"`).
+  </Step>
+  <Step title="Add metadata">
+    Always set `.meta({ title, description })` for documentation.
+  </Step>
+  <Step title="Handle errors in init">
+    If initialization fails, throw an error. Runner will catch it and report it clearly.
+  </Step>
+  <Step title="Always implement dispose">
+    Clean up resources properly to avoid leaks and ensure graceful shutdown.
+  </Step>
+  <Step title="Keep init logic focused">
+    Resources should initialize state, not perform business logic. Save that for tasks.
+  </Step>
+</Steps>
+
+## Related Concepts
+
+- [Tasks](/concepts/tasks) - Functions that depend on resources
+- [Events](/concepts/events) - Resources can emit events during init
+- [Lifecycle](/concepts/lifecycle) - How resources fit into the application lifecycle

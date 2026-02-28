@@ -1,0 +1,490 @@
+---
+title: "AWS Lambda Quickstart"
+description: "Serverless integration with Lambda using both lambdalith and per-route patterns"
+icon: "aws"
+---
+
+## Overview
+
+This example demonstrates how to deploy BlueLibs Runner applications to AWS Lambda, showing two different deployment patterns:
+
+1. **Lambdalith**: Single Lambda function handling all routes
+2. **Per-Route**: Each endpoint has its own dedicated Lambda function
+
+Both patterns share the same business logic (tasks and resources) but differ in how they expose HTTP endpoints.
+
+## Architecture
+
+The example is structured for serverless deployments:
+
+```
+src/
+├── bootstrap.ts          # Shared runner setup and caching
+├── http.ts               # Shared HTTP utilities (CORS, JSON, parsing)
+├── handler.lambdalith.ts # Single handler for all routes
+└── handlers/
+    ├── getUser.ts        # Per-route handler for GET /users/{id}
+    └── createUser.ts     # Per-route handler for POST /users
+```
+
+### Key Characteristics
+
+- **Cached Runner**: Runner instance is reused across warm Lambda invocations
+- **Shutdown Hooks Disabled**: Lambda manages process lifecycle
+- **Request Context**: Request-scoped data via `createContext`
+- **Shared HTTP Utilities**: Avoid duplication across handlers
+
+## Key Code Snippets
+
+### Shared Bootstrap
+
+<CodeGroup>
+
+```typescript bootstrap.ts
+import { resource, task, run, createContext } from "@bluelibs/runner";
+
+export interface RequestContext {
+  requestId: string;
+  method: string;
+  path: string;
+  headers: Record<string, string | undefined>;
+}
+
+export const RequestCtx = createContext<RequestContext>("app.http.request");
+
+export const usersRepo = resource({
+  id: "app.resources.usersRepo",
+  init: async () => {
+    const db = new Map<string, { id: string; name: string }>();
+    return {
+      get: async (id: string) => db.get(id) ?? null,
+      create: async (input: { name: string }) => {
+        const id = String(db.size + 1);
+        const doc = { id, name: input.name };
+        db.set(id, doc);
+        return doc;
+      },
+    };
+  },
+});
+
+export const getUser = task({
+  id: "app.tasks.getUser",
+  dependencies: { users: usersRepo },
+  run: async (input: { id: string }, { users }) => {
+    return users.get(input.id);
+  },
+});
+
+export const createUser = task({
+  id: "app.tasks.createUser",
+  dependencies: { users: usersRepo },
+  run: async (input: { name: string }, { users }) => {
+    return users.create({ name: input.name });
+  },
+});
+
+export const app = resource({
+  id: "app",
+  register: [usersRepo, getUser, createUser],
+});
+
+// Cache the runner instance across warm invocations
+let rrPromise: Promise<RunResult<void>> | null = null;
+
+export async function getRunner() {
+  if (!rrPromise) {
+    rrPromise = run(app, {
+      shutdownHooks: false,  // Lambda manages process lifecycle
+      errorBoundary: true,
+      logs: { printThreshold: "info", printStrategy: "json" },
+    });
+  }
+  return rrPromise;
+}
+```
+
+```typescript http.ts
+export interface APIGatewayProxyResult {
+  statusCode: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+export function json(status: number, data: unknown): APIGatewayProxyResult {
+  return {
+    statusCode: status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+    body: JSON.stringify(data),
+  };
+}
+
+export function parseEvent<T>(event: unknown) {
+  const evt = event as any;
+  return {
+    method: evt.httpMethod || evt.requestContext?.http?.method || "GET",
+    path: evt.path || evt.rawPath || "/",
+    headers: evt.headers || {},
+    body: evt.body ? JSON.parse(evt.body) : null as T,
+  };
+}
+
+export function preflight(method: string) {
+  if (method === "OPTIONS") {
+    return {
+      statusCode: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type,Authorization",
+      },
+      body: "",
+    };
+  }
+  return null;
+}
+
+export function errorToResponse(err: unknown): APIGatewayProxyResult {
+  return json(500, {
+    message: err instanceof Error ? err.message : "Internal server error",
+  });
+}
+```
+
+</CodeGroup>
+
+### Pattern 1: Lambdalith (Single Handler)
+
+```typescript handler.lambdalith.ts
+import { getRunner, RequestCtx, getUser, createUser } from "./bootstrap";
+import { json, parseEvent, preflight, errorToResponse } from "./http";
+import { z } from "zod";
+
+const CreateUserSchema = z.object({ name: z.string().min(1) });
+const GetUserSchema = z.object({ id: z.string().min(1) });
+
+export const handler = async (
+  event: unknown,
+  context: { awsRequestId?: string },
+) => {
+  const { method, path, headers, body } = parseEvent<{ name?: string }>(event);
+
+  // Handle CORS preflight
+  const preflightRes = preflight(method);
+  if (preflightRes) return preflightRes;
+
+  const rr = await getRunner();
+
+  return RequestCtx.provide(
+    { requestId: context?.awsRequestId ?? "local", method, path, headers },
+    async () => {
+      try {
+        // GET /users/:id
+        if (method === "GET" && path.startsWith("/users/")) {
+          const id = path.split("/").pop()!;
+          const parsed = GetUserSchema.safeParse({ id });
+          if (!parsed.success) {
+            return json(400, {
+              message: "Invalid id",
+              issues: parsed.error.issues,
+            });
+          }
+          const user = await rr.runTask(getUser, parsed.data);
+          return user ? json(200, user) : json(404, { message: "Not found" });
+        }
+
+        // POST /users
+        if (method === "POST" && path === "/users") {
+          const parsed = CreateUserSchema.safeParse({ name: body?.name });
+          if (!parsed.success) {
+            return json(400, {
+              message: "Invalid body",
+              issues: parsed.error.issues,
+            });
+          }
+          const created = await rr.runTask(createUser, parsed.data);
+          return json(201, created);
+        }
+
+        return json(404, { message: "Route not found" });
+      } catch (err: unknown) {
+        return errorToResponse(err);
+      }
+    },
+  );
+};
+```
+
+### Pattern 2: Per-Route Handlers
+
+<CodeGroup>
+
+```typescript handlers/getUser.ts
+import { getRunner, RequestCtx, getUser as getUserTask } from "../bootstrap";
+import { json, parseEvent, preflight, errorToResponse } from "../http";
+import { z } from "zod";
+
+const GetUserSchema = z.object({ id: z.string().min(1) });
+
+export const handler = async (
+  event: unknown,
+  context: { awsRequestId?: string },
+) => {
+  const { method, path, headers } = parseEvent(event);
+  const preflightRes = preflight(method);
+  if (preflightRes) return preflightRes;
+
+  const id = path.split("/").pop()!;
+  const parsed = GetUserSchema.safeParse({ id });
+  
+  if (!parsed.success) {
+    return json(400, {
+      message: "Invalid id",
+      issues: parsed.error.issues,
+    });
+  }
+
+  const rr = await getRunner();
+
+  return RequestCtx.provide(
+    { requestId: context?.awsRequestId ?? "local", method, path, headers },
+    async () => {
+      try {
+        const user = await rr.runTask(getUserTask, parsed.data);
+        return user ? json(200, user) : json(404, { message: "Not found" });
+      } catch (err) {
+        return errorToResponse(err);
+      }
+    },
+  );
+};
+```
+
+```typescript handlers/createUser.ts
+import { getRunner, RequestCtx, createUser as createUserTask } from "../bootstrap";
+import { json, parseEvent, preflight, errorToResponse } from "../http";
+import { z } from "zod";
+
+const CreateUserSchema = z.object({ name: z.string().min(1) });
+
+export const handler = async (
+  event: unknown,
+  context: { awsRequestId?: string },
+) => {
+  const { method, path, headers, body } = parseEvent<{ name?: string }>(event);
+  const preflightRes = preflight(method);
+  if (preflightRes) return preflightRes;
+
+  const parsed = CreateUserSchema.safeParse({ name: body?.name });
+  
+  if (!parsed.success) {
+    return json(400, {
+      message: "Invalid body",
+      issues: parsed.error.issues,
+    });
+  }
+
+  const rr = await getRunner();
+
+  return RequestCtx.provide(
+    { requestId: context?.awsRequestId ?? "local", method, path, headers },
+    async () => {
+      try {
+        const user = await rr.runTask(createUserTask, parsed.data);
+        return json(201, user);
+      } catch (err) {
+        return errorToResponse(err);
+      }
+    },
+  );
+};
+```
+
+</CodeGroup>
+
+## How to Run
+
+<Steps>
+
+<Step title="Install dependencies">
+  ```bash
+  cd examples/aws-lambda-quickstart
+  npm install
+  ```
+</Step>
+
+<Step title="Start locally (Serverless Framework)">
+  ```bash
+  npm run dev
+  ```
+  
+  Uses `serverless-offline` to run locally.
+</Step>
+
+<Step title="Or start with AWS SAM">
+  ```bash
+  npm run dev:sam
+  ```
+  
+  Uses AWS SAM for local testing.
+</Step>
+
+<Step title="Test the endpoints">
+  ```bash
+  # Create a user
+  curl -X POST http://localhost:3000/users \
+    -H "Content-Type: application/json" \
+    -d '{"name":"Alice"}'
+  
+  # Get a user
+  curl http://localhost:3000/users/1
+  ```
+</Step>
+
+<Step title="Deploy to AWS">
+  ```bash
+  # With Serverless Framework
+  npx serverless deploy
+  
+  # Or with AWS SAM
+  sam build
+  sam deploy --guided
+  ```
+</Step>
+
+</Steps>
+
+## Deployment Patterns Compared
+
+### Lambdalith (Single Handler)
+
+**Pros:**
+- Simpler deployment (one function)
+- Better cold start reuse (shared warm instances)
+- Easier to share dependencies and state
+- Lower AWS Lambda function count
+
+**Cons:**
+- Larger function size
+- All routes scale together
+- Harder to set per-route configs (memory, timeout)
+
+**Best for:**
+- Small to medium APIs
+- Tightly coupled routes
+- Cost-sensitive workloads (fewer functions)
+
+### Per-Route Handlers
+
+**Pros:**
+- Fine-grained scaling (hot routes scale independently)
+- Smaller function sizes (faster cold starts)
+- Per-route configuration (memory, timeout, permissions)
+- Better fault isolation
+
+**Cons:**
+- More complex deployment
+- Higher function count
+- Potential code duplication without shared utilities
+
+**Best for:**
+- Large APIs with varied traffic patterns
+- Routes with different resource requirements
+- Microservices architecture
+
+## Lambda Configuration
+
+### Shared Setup
+
+```typescript
+const rr = await run(app, {
+  shutdownHooks: false,  // Let Lambda manage lifecycle
+  errorBoundary: true,   // Catch errors gracefully
+  logs: { 
+    printThreshold: "info", 
+    printStrategy: "json"  // CloudWatch-friendly
+  },
+});
+```
+
+### Runner Caching
+
+The runner is cached across warm invocations:
+
+```typescript
+let rrPromise: Promise<RunResult<void>> | null = null;
+
+export async function getRunner() {
+  if (!rrPromise) {
+    rrPromise = run(app, { /* ... */ });
+  }
+  return rrPromise;
+}
+```
+
+This ensures:
+- Resources are initialized once per container
+- Warm starts are fast (no re-initialization)
+- Cold starts pay initialization cost only once
+
+## What to Learn
+
+### 1. Serverless Adaptability
+
+Runner works seamlessly in serverless environments by:
+- Disabling shutdown hooks (Lambda manages lifecycle)
+- Caching the runner instance across invocations
+- Using request context for request-scoped data
+
+### 2. Shared Business Logic
+
+Tasks and resources are defined once in `bootstrap.ts` and reused across both deployment patterns. This keeps your business logic DRY and framework-agnostic.
+
+### 3. Request Context
+
+`RequestCtx.provide()` wraps each handler invocation, providing request-scoped data without global state:
+
+```typescript
+const ctx = RequestCtx.use();
+console.log(ctx.requestId, ctx.method, ctx.path);
+```
+
+### 4. Deployment Flexibility
+
+Choose your pattern based on your needs:
+- Start with lambdalith for simplicity
+- Split hot routes into per-route handlers as traffic grows
+- Mix patterns (critical routes separate, others in lambdalith)
+
+### 5. Error Handling
+
+Centralized error handling with consistent responses:
+
+```typescript
+try {
+  const result = await rr.runTask(task, input);
+  return json(200, result);
+} catch (err) {
+  return errorToResponse(err); // Always returns 500 + JSON
+}
+```
+
+### 6. Input Validation
+
+Zod schemas validate inputs before task execution:
+
+```typescript
+const parsed = CreateUserSchema.safeParse(input);
+if (!parsed.success) {
+  return json(400, { message: "Invalid body", issues: parsed.error.issues });
+}
+```
+
+## Full Source
+
+View the complete example on GitHub:
+
+[github.com/bluelibs/runner/tree/main/examples/aws-lambda-quickstart](https://github.com/bluelibs/runner/tree/main/examples/aws-lambda-quickstart)

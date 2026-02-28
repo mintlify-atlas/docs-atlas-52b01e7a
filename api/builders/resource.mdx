@@ -1,0 +1,525 @@
+---
+title: "Resource Builder"
+description: "Fluent API for defining resources (singletons)"
+---
+
+## Overview
+
+The resource builder provides a fluent interface for defining long-lived singletons with lifecycle management. Resources can have configuration, dependencies, initialization logic, and disposal logic.
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const database = r.resource("app.database")
+  .configSchema<{ connectionString: string }>({ parse: (v) => v })
+  .init(async ({ config }) => {
+    const connection = await createConnection(config.connectionString);
+    return connection;
+  })
+  .dispose(async ({ value }) => {
+    await value.close();
+  })
+  .build();
+```
+
+## Methods
+
+### configSchema() / schema()
+
+Defines the validation schema for resource configuration.
+
+```typescript
+.configSchema<TConfig>(schema: IValidationSchema<TConfig>)
+.schema<TConfig>(schema: IValidationSchema<TConfig>) // Alias
+```
+
+<ParamField path="schema" type="IValidationSchema<TConfig>" required>
+  Validation schema with a `parse` method that validates and transforms config.
+  
+  ```typescript
+  .configSchema<{ port: number; host: string }>({
+    parse: (config) => {
+      if (config.port < 1 || config.port > 65535) {
+        throw new Error('Invalid port');
+      }
+      return config;
+    }
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with updated config type
+
+### resultSchema()
+
+Defines the validation schema for the initialized resource value.
+
+```typescript
+.resultSchema<TValue>(schema: IValidationSchema<TValue>)
+```
+
+<ParamField path="schema" type="IValidationSchema<TValue>" required>
+  Validation schema applied to the resource's initialized value.
+</ParamField>
+
+**Returns:** New builder with updated value type
+
+### init()
+
+Defines the resource initialization logic.
+
+```typescript
+.init<TConfig, TValue>(
+  fn: (context: ResourceInitContext<TConfig, TDeps>) => Promise<TValue>
+)
+```
+
+<ParamField path="fn" type="Function" required>
+  The initialization function. Receives a context object with:
+  - `config` - The validated resource configuration
+  - `deps` - Resolved dependencies
+  - `runtime` - Runtime instance
+  - `logger` - Scoped logger
+  - `context` - Resource-specific context (if defined with `.context()`)
+  
+  ```typescript
+  .init(async ({ config, deps, logger }) => {
+    await logger.info('Initializing database');
+    const connection = await connect(config.connectionString);
+    return connection;
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with init function set
+
+### dispose()
+
+Defines the resource cleanup logic.
+
+```typescript
+.dispose(
+  fn: (context: ResourceDisposeContext<TValue, TDeps>) => Promise<void>
+)
+```
+
+<ParamField path="fn" type="Function" required>
+  The disposal function. Receives a context object with:
+  - `value` - The initialized resource value
+  - `deps` - Resolved dependencies
+  - `config` - Resource configuration
+  - `logger` - Scoped logger
+  
+  ```typescript
+  .dispose(async ({ value, logger }) => {
+    await logger.info('Closing database connection');
+    await value.close();
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with dispose function set
+
+### dependencies()
+
+Defines dependencies to inject into the resource.
+
+```typescript
+.dependencies<TDeps>(
+  deps: TDeps | ((config: TConfig) => TDeps),
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="deps" type="DependencyMap | ((config) => DependencyMap)" required>
+  Object mapping dependency keys to resources. Can be static or a function of config.
+  
+  ```typescript
+  .dependencies((config) => ({
+    logger: globals.resources.logger,
+    cache: config.enableCache ? cacheResource : null,
+  }))
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing dependencies. When `false` (default), merges with existing.
+</ParamField>
+
+**Returns:** New builder with updated dependencies type
+
+### register()
+
+Registers tasks, events, hooks, middleware, and other resources within this resource.
+
+```typescript
+.register(
+  items: RegisterableItems | RegisterableItems[] | ((config: TConfig) => RegisterableItems | RegisterableItems[]),
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="items" type="RegisterableItems | Array | Function" required>
+  Items to register. Can include:
+  - Tasks (ITask)
+  - Resources (IResource)
+  - Events (IEvent)
+  - Hooks (IHook)
+  - Middleware (ITaskMiddleware, IResourceMiddleware)
+  - Tags (ITag)
+  
+  ```typescript
+  .register([
+    greetTask,
+    databaseResource,
+    userRegisteredEvent,
+    sendWelcomeHook,
+  ])
+  
+  // Or conditionally based on config:
+  .register((config) => config.enableFeature ? [featureTasks] : [])
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing registrations. When `false` (default), appends.
+</ParamField>
+
+**Returns:** New builder with items registered
+
+### exports()
+
+Declares which registered items are visible outside this resource.
+
+```typescript
+.exports(
+  items: RegisterableItems[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="items" type="RegisterableItems[]" required>
+  Items to make public. When omitted, all registered items are public.
+  
+  ```typescript
+  .register([publicTask, privateTask, internalHelper])
+  .exports([publicTask])
+  // Only publicTask is accessible outside this resource
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing exports. When `false` (default), appends.
+</ParamField>
+
+**Returns:** New builder with exports defined
+
+### overrides()
+
+Declares overrides to modify registered components.
+
+```typescript
+.overrides(
+  overrides: OverridableElements[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="overrides" type="OverridableElements[]" required>
+  Array of override definitions.
+  
+  ```typescript
+  .overrides([
+    r.override().task(someTask).middleware([customMiddleware]).build(),
+  ])
+  ```
+</ParamField>
+
+**Returns:** New builder with overrides registered
+
+### middleware()
+
+Attaches middleware to the resource.
+
+```typescript
+.middleware<TMiddleware>(
+  mw: ResourceMiddlewareAttachment[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="mw" type="ResourceMiddlewareAttachment[]" required>
+  Array of resource middleware attachments.
+  
+  ```typescript
+  .middleware([
+    globals.middleware.resource.retry.with({ maxAttempts: 3 }),
+    globals.middleware.resource.timeout.with({ ms: 10000 }),
+  ])
+  ```
+</ParamField>
+
+**Returns:** New builder with middleware attached
+
+### tags()
+
+Attaches tags for grouping and filtering.
+
+```typescript
+.tags<TTags>(
+  tags: TagType[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="tags" type="TagType[]" required>
+  Array of tag definitions.
+</ParamField>
+
+**Returns:** New builder with tags attached
+
+### context()
+
+Defines a context factory for resource-specific state.
+
+```typescript
+.context<TContext>(factory: () => TContext)
+```
+
+<ParamField path="factory" type="() => TContext" required>
+  Factory function that creates the context object.
+  
+  ```typescript
+  .context(() => ({
+    connections: new Map(),
+    stats: { requests: 0 },
+  }))
+  ```
+  
+  The context is accessible in `init()` and `dispose()`.
+</ParamField>
+
+**Returns:** New builder with context defined
+
+### meta()
+
+Attaches metadata for documentation and tooling.
+
+```typescript
+.meta<TMeta>(metadata: IResourceMeta)
+```
+
+<ParamField path="metadata" type="IResourceMeta" required>
+  Metadata object with optional `title` and `description`.
+</ParamField>
+
+**Returns:** New builder with metadata attached
+
+### throws()
+
+Documents which errors the resource initialization may throw.
+
+```typescript
+.throws(errorList: ThrowsList)
+```
+
+**Returns:** New builder with error documentation
+
+### build()
+
+Builds and returns the final resource definition.
+
+```typescript
+.build(): IResource<TConfig, TValue, TDeps, TContext, TMeta, TTags, TMiddleware>
+```
+
+**Returns:** Immutable resource definition
+
+### with()
+
+Attaches configuration to the resource (called on the built resource, not the builder).
+
+```typescript
+const configuredResource = resource.with(config);
+```
+
+<ParamField path="config" type="TConfig" required>
+  Configuration object matching the resource's config schema.
+  
+  ```typescript
+  const server = serverResource.with({ port: 3000, host: 'localhost' });
+  const runtime = await run(server);
+  ```
+</ParamField>
+
+**Returns:** `IResourceWithConfig<TConfig, TValue>`
+
+## Type Signature
+
+```typescript
+interface ResourceFluentBuilder<
+  TConfig = void,
+  TValue extends Promise<any> = Promise<any>,
+  TDeps extends DependencyMapType = {},
+  TContext = any,
+  TMeta extends IResourceMeta = IResourceMeta,
+  TTags extends TagType[] = TagType[],
+  TMiddleware extends ResourceMiddlewareAttachmentType[] = ResourceMiddlewareAttachmentType[]
+> {
+  id: string;
+  configSchema<TNewConfig>(schema: IValidationSchema<TNewConfig>): ResourceFluentBuilder<...>;
+  schema<TNewConfig>(schema: IValidationSchema<TNewConfig>): ResourceFluentBuilder<...>;
+  resultSchema<TResolved>(schema: IValidationSchema<TResolved>): ResourceFluentBuilder<...>;
+  init<TNewConfig, TNewValue>(fn: ResourceInitFn<...>): ResourceFluentBuilder<...>;
+  dispose(fn: ResourceDisposeFn<...>): ResourceFluentBuilder<...>;
+  dependencies<TNewDeps>(deps: TNewDeps | ((config) => TNewDeps), options?: { override?: boolean }): ResourceFluentBuilder<...>;
+  register(items: RegisterableItems | RegisterableItems[] | Function, options?: { override?: boolean }): ResourceFluentBuilder<...>;
+  exports(items: RegisterableItems[], options?: { override?: boolean }): ResourceFluentBuilder<...>;
+  overrides(overrides: OverridableElements[], options?: { override?: boolean }): ResourceFluentBuilder<...>;
+  middleware<TNewMw>(mw: TNewMw, options?: { override?: boolean }): ResourceFluentBuilder<...>;
+  tags<TNewTags>(tags: TNewTags, options?: { override?: boolean }): ResourceFluentBuilder<...>;
+  context<TNewContext>(factory: () => TNewContext): ResourceFluentBuilder<...>;
+  meta<TNewMeta>(meta: TNewMeta): ResourceFluentBuilder<...>;
+  throws(list: ThrowsList): ResourceFluentBuilder<...>;
+  build(): IResource<TConfig, TValue, TDeps, TContext, TMeta, TTags, TMiddleware>;
+}
+```
+
+## Examples
+
+### Basic Resource
+
+```typescript
+const logger = r.resource("app.logger")
+  .init(async () => {
+    return new Logger();
+  })
+  .build();
+```
+
+### Resource with Configuration
+
+```typescript
+const server = r.resource("app.server")
+  .configSchema<{ port: number; host: string }>({
+    parse: (v) => v
+  })
+  .init(async ({ config, logger }) => {
+    await logger.info(`Starting server on ${config.host}:${config.port}`);
+    const server = await startServer(config);
+    return server;
+  })
+  .dispose(async ({ value, logger }) => {
+    await logger.info('Shutting down server');
+    await value.close();
+  })
+  .build();
+
+const runtime = await run(server.with({ port: 3000, host: 'localhost' }));
+```
+
+### Resource with Dependencies
+
+```typescript
+const emailService = r.resource("app.emailService")
+  .configSchema<{ apiKey: string }>({ parse: (v) => v })
+  .dependencies(() => ({
+    logger: globals.resources.logger,
+    httpClient: httpClientResource,
+  }))
+  .init(async ({ config, deps, logger }) => {
+    await logger.info('Initializing email service');
+    return new EmailService(config.apiKey, deps.httpClient);
+  })
+  .build();
+```
+
+### Application Resource with Registrations
+
+```typescript
+const app = r.resource("app")
+  .register([
+    // Resources
+    databaseResource,
+    cacheResource,
+    emailService,
+    
+    // Tasks
+    createUserTask,
+    sendEmailTask,
+    processOrderTask,
+    
+    // Events
+    userRegisteredEvent,
+    orderProcessedEvent,
+    
+    // Hooks
+    sendWelcomeEmailHook,
+    updateMetricsHook,
+  ])
+  .init(async ({ logger }) => {
+    await logger.info('Application initialized');
+    return { version: '1.0.0' };
+  })
+  .build();
+
+const runtime = await run(app);
+```
+
+### Resource with Exports (Encapsulation)
+
+```typescript
+const authModule = r.resource("app.modules.auth")
+  .register([
+    // Public API
+    loginTask,
+    logoutTask,
+    
+    // Internal implementation
+    hashPasswordTask,
+    validateTokenTask,
+    jwtService,
+  ])
+  .exports([
+    loginTask,
+    logoutTask,
+    // Internal tasks not exported
+  ])
+  .build();
+```
+
+### Resource with Context
+
+```typescript
+const connectionPool = r.resource("app.connectionPool")
+  .context(() => ({
+    connections: new Map<string, Connection>(),
+    stats: { active: 0, total: 0 },
+  }))
+  .init(async ({ config, context, logger }) => {
+    await logger.info('Initializing connection pool');
+    return {
+      getConnection: (id: string) => context.connections.get(id),
+      createConnection: async (id: string) => {
+        const conn = await createConnection();
+        context.connections.set(id, conn);
+        context.stats.total++;
+        return conn;
+      },
+    };
+  })
+  .dispose(async ({ context, logger }) => {
+    await logger.info(`Closing ${context.connections.size} connections`);
+    for (const conn of context.connections.values()) {
+      await conn.close();
+    }
+  })
+  .build();
+```
+
+## Related
+
+- [r namespace](/api/r)
+- [run()](/api/run)
+- [Runtime - getResourceValue()](/api/runtime/runtime#getresourcevalue)
+- [Resource Guide](/concepts/resources)

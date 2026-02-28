@@ -1,0 +1,343 @@
+---
+title: Tasks
+description: Async functions with dependency injection and middleware
+---
+
+## What Are Tasks?
+
+Tasks are your business logic functions in BlueLibs Runner. They are async functions with **explicit dependency injection**, **type-safe inputs/outputs**, **middleware support**, and **observability baked in**.
+
+Think of tasks as the "main actors" in your application — the functions that do important things like creating users, processing orders, or sending emails.
+
+## Why Use Tasks?
+
+Tasks solve the problem of **manually passing dependencies** through your application. Instead of wiring everything by hand, you declare what a task needs, and Runner handles the rest.
+
+<Note>
+**When to use tasks**: Make something a task when it's a core business operation that needs dependency injection, middleware features (auth, caching, retry), or observability.
+
+**When to use regular functions**: Keep it as a regular function when it's a simple utility (date formatting, string manipulation) or a pure function with no dependencies.
+</Note>
+
+## Creating Your First Task
+
+Here's the simplest possible task:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+const greet = r
+  .task("app.tasks.greet")
+  .run(async (name: string) => `Hello, ${name}!`)
+  .build();
+
+const app = r
+  .resource("app")
+  .register([greet])
+  .build();
+
+const { runTask, dispose } = await run(app);
+const message = await runTask(greet, "World");
+console.log(message); // "Hello, World!"
+await dispose();
+```
+
+<Steps>
+  <Step title="Define the task">
+    Use `r.task(id)` to create a task builder. Give it a unique namespaced ID like `"app.tasks.greet"`.
+  </Step>
+  <Step title="Add the run function">
+    Call `.run(async (input, deps) => { ... })` to define what the task does.
+  </Step>
+  <Step title="Build it">
+    Call `.build()` to finalize the task definition.
+  </Step>
+  <Step title="Register it">
+    Add the task to a resource's `.register([...])` array so the runtime knows about it.
+  </Step>
+  <Step title="Execute it">
+    Use `runTask(task, input)` to run the task with full dependency injection and middleware.
+  </Step>
+</Steps>
+
+## Tasks with Dependencies
+
+Tasks can depend on resources, other tasks, or events. Dependencies are injected automatically:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const db = r
+  .resource("app.db")
+  .init(async () => ({ users: { insert: async (data: any) => data } }))
+  .build();
+
+const mailer = r
+  .resource("app.mailer")
+  .init(async () => ({
+    sendWelcome: async (email: string) => {
+      console.log(`Sending welcome email to ${email}`);
+    },
+  }))
+  .build();
+
+const createUser = r
+  .task("users.create")
+  .dependencies({ db, mailer, logger: globals.resources.logger })
+  .run(async (input: { name: string; email: string }, { db, mailer, logger }) => {
+    await logger.info(`Creating user ${input.name}`);
+    const user = await db.users.insert(input);
+    await mailer.sendWelcome(user.email);
+    return user;
+  })
+  .build();
+```
+
+<Tip>
+Dependencies declared in `.dependencies({ ... })` are automatically injected as the second parameter to `.run()`. TypeScript infers the types, so you get full autocomplete.
+</Tip>
+
+## Input and Output Validation
+
+Use **Zod schemas** to validate inputs and outputs at runtime:
+
+```typescript
+import { r } from "@bluelibs/runner";
+import { z } from "zod";
+
+const createUser = r
+  .task("users.create")
+  .inputSchema(
+    z.object({
+      name: z.string().min(1),
+      email: z.string().email(),
+    })
+  )
+  .resultSchema(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      email: z.string(),
+    })
+  )
+  .run(async (input) => {
+    // input is type-safe: { name: string; email: string }
+    return {
+      id: "user-123",
+      name: input.name,
+      email: input.email,
+    };
+  })
+  .build();
+```
+
+- **`inputSchema`**: Validates the input when the task is called. Throws a `ValidationError` if invalid.
+- **`resultSchema`**: Validates the output before returning. Ensures your task always returns what it promises.
+
+## Middleware for Cross-Cutting Concerns
+
+Middleware wraps tasks to add features like caching, retry, timeouts, and auth **without cluttering your business logic**:
+
+<CodeGroup>
+
+```typescript Caching
+import { r, globals } from "@bluelibs/runner";
+
+const getUser = r
+  .task("users.get")
+  .middleware([
+    globals.middleware.task.cache.with({
+      ttl: 60 * 1000, // 1 minute
+      keyBuilder: (taskId, input) => `user:${input.id}`,
+    }),
+  ])
+  .run(async (input: { id: string }) => {
+    // This only runs on cache miss
+    return await db.users.findOne({ id: input.id });
+  })
+  .build();
+```
+
+```typescript Retry
+import { r, globals } from "@bluelibs/runner";
+
+const callAPI = r
+  .task("api.external")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      delayStrategy: (attempt) => 100 * Math.pow(2, attempt),
+    }),
+  ])
+  .run(async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  })
+  .build();
+```
+
+```typescript Timeout
+import { r, globals } from "@bluelibs/runner";
+
+const slowOperation = r
+  .task("operations.slow")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 }), // 5 seconds
+  ])
+  .run(async () => {
+    return await someSlowDatabaseQuery();
+  })
+  .build();
+```
+
+</CodeGroup>
+
+<Tip>
+Middleware is **composable**: you can stack multiple middlewares on a single task. They execute in order, wrapping each other like layers of an onion.
+</Tip>
+
+## Two Ways to Call Tasks
+
+Runner gives you two execution modes with different tradeoffs:
+
+### 1. Production/Integration: `runTask()`
+
+Use this in production or integration tests. It gives you the **full pipeline**: DI, middleware, validation, and events.
+
+```typescript
+const { runTask, dispose } = await run(app);
+const result = await runTask(createUser, {
+  name: "Ada",
+  email: "ada@example.com",
+});
+await dispose();
+```
+
+### 2. Unit Testing: `.run()`
+
+Use this in unit tests. It **bypasses middleware** and lets you pass mock dependencies directly:
+
+```typescript
+const result = await createUser.run(
+  { name: "Ada", email: "ada@example.com" },
+  { db: mockDb, mailer: mockMailer, logger: mockLogger }
+);
+```
+
+<Note>
+**Key difference**: `runTask()` runs through the full pipeline (middleware, validation, events). `.run()` is a direct call with mocks — faster and more isolated for unit tests.
+</Note>
+
+## Task Context
+
+The third parameter to `.run()` is the **execution context**, which gives you access to runtime state:
+
+```typescript
+const myTask = r
+  .task("app.tasks.example")
+  .run(async (input, deps, { journal }) => {
+    // Access middleware state via ExecutionJournal
+    const ctrl = journal.get(
+      globals.middleware.task.timeout.journalKeys.abortController
+    );
+    
+    // Use the AbortController to handle cancellation
+    if (ctrl?.signal.aborted) {
+      return "Operation cancelled";
+    }
+    
+    return "Success";
+  })
+  .build();
+```
+
+## Real-World Example: User Registration
+
+Here's a complete example showing tasks, dependencies, validation, and middleware:
+
+```typescript src/users/tasks/register.task.ts
+import { r, globals } from "@bluelibs/runner";
+import { z } from "zod";
+import { db } from "#/db/resources";
+import { auth } from "#/users/resources/auth.resource";
+
+export const registerUser = r
+  .task("app.users.tasks.register")
+  .meta({
+    title: "User Registration",
+    description: "Register new user and return JWT token",
+  })
+  .inputSchema(
+    z.object({
+      name: z.string().min(1),
+      email: z.string().email(),
+      password: z.string().min(6),
+    })
+  )
+  .resultSchema(
+    z.object({
+      token: z.string(),
+      user: z.object({ id: z.string(), name: z.string(), email: z.string() }),
+    })
+  )
+  .dependencies({ db, auth })
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 10000 }), // 10s timeout
+  ])
+  .run(async (input, { db, auth }) => {
+    const { name, email, password } = input;
+    
+    const em = db.em();
+    const User = db.entities.User;
+    const existing = await em.findOne(User, { email });
+    if (existing) {
+      throw new Error("Email already registered");
+    }
+    
+    const { hash, salt } = await auth.hashPassword(password);
+    const user = em.create(User, {
+      id: randomUUID(),
+      name,
+      email,
+      passwordHash: hash,
+      passwordSalt: salt,
+    });
+    em.persist(user);
+    await em.flush();
+    
+    const token = auth.createSessionToken(user.id);
+    return {
+      token,
+      user: { id: user.id, name: user.name, email: user.email },
+    };
+  })
+  .build();
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Use descriptive IDs">
+    Follow the pattern `domain.tasks.actionName` (e.g., `"users.tasks.create"`, `"orders.tasks.process"`).
+  </Step>
+  <Step title="Add metadata">
+    Always set `.meta({ title, description })` for documentation and tooling.
+  </Step>
+  <Step title="Validate inputs and outputs">
+    Use `.inputSchema()` and `.resultSchema()` to catch errors early and generate type-safe interfaces.
+  </Step>
+  <Step title="Keep tasks focused">
+    One task should do one thing well. Use dependencies to compose behavior.
+  </Step>
+  <Step title="Use middleware for cross-cutting concerns">
+    Don't repeat auth, caching, or retry logic in every task. Use middleware instead.
+  </Step>
+</Steps>
+
+## Related Concepts
+
+- [Resources](/concepts/resources) - Singletons that tasks depend on
+- [Events](/concepts/events) - Decouple tasks with typed messages
+- [Hooks](/concepts/hooks) - Lightweight event subscribers
+- [Lifecycle](/concepts/lifecycle) - How tasks fit into the application lifecycle

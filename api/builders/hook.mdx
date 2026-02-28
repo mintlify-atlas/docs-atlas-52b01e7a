@@ -1,0 +1,439 @@
+---
+title: "Hook Builder"
+description: "Fluent API for defining event listeners (hooks)"
+---
+
+## Overview
+
+The hook builder provides a fluent interface for defining event listeners. Hooks execute when their target event(s) are emitted, enabling reactive and decoupled architecture.
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const sendWelcomeEmail = r.hook("app.hooks.sendWelcome")
+  .on(userRegisteredEvent)
+  .order(10)
+  .dependencies(() => ({ emailService }))
+  .run(async ({ payload, deps, logger }) => {
+    await logger.info(`Sending welcome email to ${payload.email}`);
+    await deps.emailService.send(payload.email, "Welcome!");
+  })
+  .build();
+```
+
+## Methods
+
+### on()
+
+Specifies which event(s) this hook listens to.
+
+```typescript
+.on<TOn>(event: TOn)
+```
+
+<ParamField path="event" type="IEvent | IEvent[] | '*'" required>
+  The event(s) to listen to. Can be:
+  - A single event definition
+  - An array of event definitions
+  - `"*"` to listen to all events
+  
+  ```typescript
+  // Single event
+  .on(userRegisteredEvent)
+  
+  // Multiple events
+  .on([orderCreated, orderUpdated, orderDeleted])
+  
+  // All events (wildcard)
+  .on("*")
+  ```
+</ParamField>
+
+**Returns:** New builder with event target set (required before `build()`)
+
+### run()
+
+Defines the hook's execution logic.
+
+```typescript
+.run(
+  fn: (context: HookContext<TPayload, TDeps>) => Promise<void>
+)
+```
+
+<ParamField path="fn" type="Function" required>
+  The hook execution function. Receives a context object with:
+  - `payload` - The event payload (typed based on the event)
+  - `event` - The event definition that was emitted
+  - `deps` - Resolved dependencies
+  - `runtime` - Runtime instance
+  - `logger` - Scoped logger
+  
+  ```typescript
+  .run(async ({ payload, event, deps, runtime, logger }) => {
+    await logger.info(`Handling ${event.id}`);
+    await deps.notificationService.notify(payload);
+    await runtime.runTask(updateMetricsTask, { event: event.id });
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with run function set (required before `build()`)
+
+### order()
+
+Sets the execution order for this hook.
+
+```typescript
+.order(priority: number)
+```
+
+<ParamField path="priority" type="number" default="0">
+  Execution priority. Lower numbers run first. Hooks with the same order run concurrently if the event has `parallel(true)`.
+  
+  ```typescript
+  // Early hook (runs first)
+  .order(-10)
+  
+  // Default priority
+  .order(0)
+  
+  // Late hook (runs last)
+  .order(100)
+  ```
+</ParamField>
+
+**Returns:** New builder with order set
+
+### dependencies()
+
+Defines dependencies to inject into the hook.
+
+```typescript
+.dependencies<TDeps>(
+  deps: TDeps | (() => TDeps),
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="deps" type="DependencyMap | () => DependencyMap" required>
+  Object mapping dependency keys to resources. Can be static or a function.
+  
+  ```typescript
+  .dependencies(() => ({
+    emailService: emailServiceResource,
+    logger: globals.resources.logger,
+    database: databaseResource,
+  }))
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing dependencies. When `false` (default), merges with existing.
+</ParamField>
+
+**Returns:** New builder with updated dependencies type
+
+### tags()
+
+Attaches tags for grouping and filtering.
+
+```typescript
+.tags<TTags>(
+  tags: TagType[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="tags" type="TagType[]" required>
+  Array of tag definitions.
+  
+  ```typescript
+  .tags([criticalTag, asyncTag])
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing tags. When `false` (default), appends to existing.
+</ParamField>
+
+**Returns:** New builder with tags attached
+
+### meta()
+
+Attaches metadata for documentation and tooling.
+
+```typescript
+.meta<TMeta>(metadata: ITaskMeta)
+```
+
+<ParamField path="metadata" type="ITaskMeta" required>
+  Metadata object with optional `title` and `description`.
+  
+  ```typescript
+  .meta({
+    title: "Send Welcome Email",
+    description: "Sends a welcome email when user registers",
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with metadata attached
+
+### throws()
+
+Documents which errors the hook may throw.
+
+```typescript
+.throws(errorList: ThrowsList)
+```
+
+<ParamField path="errorList" type="ThrowsList" required>
+  Array of error classes. This is declarative only (for documentation).
+  
+  ```typescript
+  .throws([EmailError, NetworkError])
+  ```
+</ParamField>
+
+**Returns:** New builder with error documentation
+
+### build()
+
+Builds and returns the final hook definition.
+
+```typescript
+.build(): IHook<TDeps, TOn, TMeta>
+```
+
+**Returns:** Immutable hook definition ready to register
+
+**Throws:** Error if `on()` or `run()` was not called
+
+## Type Signature
+
+```typescript
+interface HookFluentBuilder<
+  TDeps extends DependencyMapType = {},
+  TOn extends ValidOnTarget | undefined = undefined,
+  TMeta extends ITaskMeta = ITaskMeta
+> {
+  id: string;
+  on<TNewOn extends ValidOnTarget>(on: TNewOn): HookFluentBuilder<TDeps, TNewOn, TMeta>;
+  order(order: number): HookFluentBuilder<TDeps, TOn, TMeta>;
+  dependencies<TNewDeps extends DependencyMapType>(
+    deps: TNewDeps | (() => TNewDeps),
+    options?: { override?: boolean }
+  ): HookFluentBuilder<TDeps & TNewDeps, TOn, TMeta>;
+  tags<TNewTags extends TagType[]>(
+    t: TNewTags,
+    options?: { override?: boolean }
+  ): HookFluentBuilder<TDeps, TOn, TMeta>;
+  meta<TNewMeta extends ITaskMeta>(m: TNewMeta): HookFluentBuilder<TDeps, TOn, TNewMeta>;
+  throws(list: ThrowsList): HookFluentBuilder<TDeps, TOn, TMeta>;
+  run(fn: IHookDefinition<TDeps, ResolvedOn<TOn>, TMeta>["run"]): HookFluentBuilder<TDeps, TOn, TMeta>;
+  build(): IHook<TDeps, ResolvedOn<TOn>, TMeta>;
+}
+```
+
+## Examples
+
+### Basic Hook
+
+```typescript
+const logEvent = r.hook("app.hooks.logEvent")
+  .on(userRegisteredEvent)
+  .run(async ({ payload, logger }) => {
+    await logger.info(`User registered: ${payload.email}`);
+  })
+  .build();
+```
+
+### Hook with Dependencies
+
+```typescript
+const sendWelcomeEmail = r.hook("app.hooks.sendWelcome")
+  .on(userRegisteredEvent)
+  .dependencies(() => ({
+    emailService: emailServiceResource,
+    templateEngine: templateResource,
+  }))
+  .run(async ({ payload, deps, logger }) => {
+    await logger.info(`Sending welcome email to ${payload.email}`);
+    const content = await deps.templateEngine.render('welcome', payload);
+    await deps.emailService.send(payload.email, content);
+  })
+  .build();
+```
+
+### Hook with Order (Priority)
+
+```typescript
+// High priority - runs first
+const validateData = r.hook("app.hooks.validate")
+  .on(dataReceivedEvent)
+  .order(-100)
+  .run(async ({ payload }) => {
+    if (!isValid(payload)) throw new ValidationError();
+  })
+  .build();
+
+// Normal priority
+const processData = r.hook("app.hooks.process")
+  .on(dataReceivedEvent)
+  .order(0)
+  .run(async ({ payload }) => {
+    await processData(payload);
+  })
+  .build();
+
+// Low priority - runs last
+const logCompletion = r.hook("app.hooks.logComplete")
+  .on(dataReceivedEvent)
+  .order(100)
+  .run(async ({ logger }) => {
+    await logger.info('Data processing complete');
+  })
+  .build();
+```
+
+### Hook Listening to Multiple Events
+
+```typescript
+const trackUserActivity = r.hook("app.hooks.trackActivity")
+  .on([userLoggedIn, userLoggedOut, userUpdatedProfile])
+  .dependencies(() => ({ analytics: analyticsResource }))
+  .run(async ({ payload, event, deps }) => {
+    await deps.analytics.track(event.id, payload);
+  })
+  .build();
+```
+
+### Wildcard Hook (All Events)
+
+```typescript
+const debugLogger = r.hook("app.hooks.debugAll")
+  .on("*")
+  .run(async ({ event, payload, logger }) => {
+    await logger.debug(`Event emitted: ${event.id}`, { payload });
+  })
+  .build();
+```
+
+### Hook with Task Execution
+
+```typescript
+const processOrderHook = r.hook("app.hooks.processOrder")
+  .on(orderCreatedEvent)
+  .dependencies(() => ({
+    processOrderTask,
+  }))
+  .run(async ({ payload, runtime }) => {
+    // Execute a task in response to event
+    await runtime.runTask(processOrderTask, { orderId: payload.orderId });
+  })
+  .build();
+```
+
+### Hook with Error Handling
+
+```typescript
+const notifyAdmin = r.hook("app.hooks.notifyAdmin")
+  .on(criticalErrorEvent)
+  .dependencies(() => ({
+    alertService: alertServiceResource,
+  }))
+  .throws([AlertError, NetworkError])
+  .meta({
+    title: "Notify Admin on Critical Error",
+    description: "Sends alert to admin when critical errors occur",
+  })
+  .run(async ({ payload, deps, logger }) => {
+    try {
+      await deps.alertService.send(payload);
+    } catch (error) {
+      await logger.error('Failed to notify admin', { error });
+      throw error; // Re-throw to mark hook as failed
+    }
+  })
+  .build();
+```
+
+### Conditional Hook Logic
+
+```typescript
+const sendNotification = r.hook("app.hooks.notify")
+  .on(orderStatusChanged)
+  .dependencies(() => ({
+    notificationService: notificationResource,
+    userPreferences: preferencesResource,
+  }))
+  .run(async ({ payload, deps, logger }) => {
+    const prefs = await deps.userPreferences.get(payload.userId);
+    
+    if (!prefs.emailNotifications) {
+      await logger.debug('Skipping notification - user disabled emails');
+      return;
+    }
+    
+    await deps.notificationService.send(payload.userId, payload.status);
+  })
+  .build();
+```
+
+## Hook Execution Model
+
+### Sequential Execution
+
+Hooks execute in order (lowest to highest):
+
+```typescript
+// Order: -10
+const first = r.hook("first").on(event).order(-10).run(async () => {}).build();
+
+// Order: 0 (default)
+const second = r.hook("second").on(event).run(async () => {}).build();
+
+// Order: 10
+const third = r.hook("third").on(event).order(10).run(async () => {}).build();
+
+// Execution: first → second → third
+```
+
+### Parallel Execution
+
+Hooks with same order run concurrently if event has `parallel(true)`:
+
+```typescript
+const event = r.event("myEvent").parallel(true).build();
+
+// All have order 0 - run in parallel
+const hook1 = r.hook("h1").on(event).run(async () => {}).build();
+const hook2 = r.hook("h2").on(event).run(async () => {}).build();
+const hook3 = r.hook("h3").on(event).run(async () => {}).build();
+```
+
+### Error Handling
+
+By default, hook errors are logged but don't stop other hooks:
+
+```typescript
+await runtime.emitEvent(myEvent, payload, {
+  failureMode: 'continue', // Continue even if hooks fail (default)
+  throwOnError: false, // Don't throw on hook failure (default)
+});
+
+// Or get detailed report:
+const report = await runtime.emitEvent(myEvent, payload, { report: true });
+if (report.failedListeners.length > 0) {
+  console.error('Failed hooks:', report.failedListeners);
+}
+```
+
+## Related
+
+- [r namespace](/api/r)
+- [Event Builder](/api/builders/event)
+- [Runtime - emitEvent()](/api/runtime/runtime#emitevent)
+- [Hooks Guide](/concepts/hooks)
+- [Events Guide](/concepts/events)

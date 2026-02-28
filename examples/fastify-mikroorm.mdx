@@ -1,0 +1,414 @@
+---
+title: "Fastify + MikroORM + PostgreSQL"
+description: "Production-ready app with Fastify, MikroORM, authentication, and Runner Dev portal"
+icon: "bolt"
+---
+
+## Overview
+
+A minimal yet production-ready application built with BlueLibs Runner, Fastify, and MikroORM (PostgreSQL). This example includes:
+
+- **Fastify HTTP Server** with automatic route registration
+- **MikroORM** with PostgreSQL database and migrations
+- **Authentication** with HMAC-signed tokens (cookie or Bearer)
+- **Authorization Middleware** with role-based access control
+- **Runner Dev Portal** for live introspection and GraphQL API
+- **Health/Readiness Checks** for Kubernetes deployments
+- **Swagger UI** with auto-generated OpenAPI docs
+- **Comprehensive Test Suite** with 100% coverage
+
+## Architecture
+
+The application demonstrates a clean feature-based structure:
+
+```
+src/
+├── http/           # Fastify server, router, tags, middleware
+├── users/          # User feature (tasks, resources, auth)
+├── db/             # MikroORM entities, migrations, fixtures
+└── general/        # Environment config, test utilities
+```
+
+### What Runs Where
+
+- **Runner Dev Portal**: `http://localhost:1337` (GraphQL, Voyager, Docs)
+- **Fastify HTTP Server**: `http://localhost:3000`
+- **Swagger UI**: `http://localhost:3000/swagger`
+- **PostgreSQL Database**: Local or Docker container
+
+## Key Code Snippets
+
+### HTTP Route Tag
+
+```typescript
+export interface HttpRouteConfig {
+  method: "get" | "post" | "put" | "delete" | "patch" | "options" | "head";
+  path: string;
+  inputFrom?: "body" | "merged"; // merged = {...params, ...query, ...body}
+  auth?: "public" | "optional" | "required";
+}
+
+export const httpRoute = r
+  .tag("app.http.tags.http-route")
+  .configSchema<HttpRouteConfig>({ parse: (x: any) => x })
+  .meta({
+    title: "HTTP Route Tag",
+    description: "Tag for marking tasks as HTTP endpoints",
+  })
+  .build();
+```
+
+### Task with HTTP Endpoint
+
+<CodeGroup>
+
+```typescript Register Task
+export const registerUser = r
+  .task("app.users.tasks.register")
+  .meta({
+    title: "User Registration",
+    description: "Register new user with name, email and password",
+  })
+  .inputSchema(
+    z.object({
+      name: z.string().min(1),
+      email: z.string().email(),
+      password: z.string().min(6),
+    }),
+  )
+  .resultSchema(
+    z.object({
+      token: z.string(),
+      user: z.object({ 
+        id: z.string(), 
+        name: z.string(), 
+        email: z.string() 
+      }),
+    }),
+  )
+  .tags([
+    httpRoute.with({ 
+      method: "post", 
+      path: "/auth/register", 
+      auth: "public" 
+    }),
+  ])
+  .dependencies({ db, auth: authResource })
+  .run(async (input, { db, auth }) => {
+    const { reply } = fastifyContext.use();
+    
+    const em = db.em();
+    const User = db.entities.User;
+    
+    const existing = await em.findOne(User, { email: input.email });
+    if (existing) throw new HTTPError(409, "Email already registered");
+    
+    const { hash, salt } = await auth.hashPassword(input.password);
+    const user = em.create(User, {
+      id: randomUUID(),
+      name: input.name,
+      email: input.email,
+      passwordHash: hash,
+      passwordSalt: salt,
+    });
+    
+    em.persist(user);
+    await em.flush();
+    
+    const token = auth.createSessionToken(user.id);
+    reply.header("Set-Cookie", auth.buildAuthCookie(token));
+    
+    return {
+      token,
+      user: { id: user.id, name: user.name, email: user.email },
+    };
+  })
+  .build();
+```
+
+```typescript Authorization Middleware
+export const authorize = r.middleware
+  .task("http.middleware.task.authorize")
+  .configSchema<AuthorizeConfig>({ 
+    parse: (x: unknown) => x as AuthorizeConfig 
+  })
+  .run(async ({ task, next }, _deps, config) => {
+    const { user, request } = fastifyContext.use();
+    
+    const required = config?.required ?? true;
+    if (required && !user) {
+      throw new HTTPError(401, "Unauthorized");
+    }
+    
+    if (config?.roles && config.roles.length > 0) {
+      const role = user?.role || request?.headers?.["x-user-role"];
+      if (!role || !config.roles.includes(role)) {
+        throw new HTTPError(403, "Forbidden");
+      }
+    }
+    
+    return next(task.input);
+  })
+  .build();
+```
+
+```typescript Protected Task
+export const listAllUsers = r
+  .task("app.users.tasks.listAllUsers")
+  .meta({
+    title: "List All Users",
+    description: "Returns all users (admin only)",
+  })
+  .inputSchema(z.undefined())
+  .resultSchema(
+    z.array(
+      z.object({
+        id: z.string(),
+        name: z.string(),
+        email: z.string().email(),
+      }),
+    ),
+  )
+  .tags([
+    httpRoute.with({ 
+      method: "get", 
+      path: "/users", 
+      auth: "required" 
+    }),
+  ])
+  .middleware([authorize.with({ roles: ["admin"] })])
+  .dependencies({ db })
+  .run(async (_input, { db }) => {
+    const em = db.em();
+    const users = await em.find(db.entities.User, {});
+    
+    return users.map((u) => ({
+      id: u.id,
+      name: u.name,
+      email: u.email,
+    }));
+  })
+  .build();
+```
+
+</CodeGroup>
+
+### Fastify Context
+
+```typescript
+export const fastifyContext = createContext<FastifyContext>("http.context");
+
+// Usage in tasks
+const { request, reply, user, userId, logger, requestId } = fastifyContext.use();
+```
+
+### MikroORM Entity
+
+```typescript
+@Entity({ tableName: "users" })
+export class User {
+  @PrimaryKey({ type: "uuid" })
+  id!: string;
+
+  @Property()
+  name!: string;
+
+  @Property({ unique: true })
+  email!: string;
+
+  @Property({ hidden: true })
+  passwordHash!: string;
+
+  @Property({ hidden: true })
+  passwordSalt!: string;
+
+  @OneToMany(() => Post, (post) => post.author)
+  posts = new Collection<Post>(this);
+}
+```
+
+## How to Run
+
+<Steps>
+
+<Step title="Start PostgreSQL">
+  Quick setup with Docker:
+  ```bash
+  docker run --name runner-pg \
+    -e POSTGRES_USER=myuser \
+    -e POSTGRES_PASSWORD=mysecretpassword \
+    -e POSTGRES_DB=clearspec \
+    -p 5433:5432 -d postgres:16
+  ```
+</Step>
+
+<Step title="Configure environment">
+  Copy `.env.example` to `.env` and update:
+  ```bash
+  DATABASE_URL=postgres://myuser:mysecretpassword@localhost:5433/clearspec
+  AUTH_SECRET=your-strong-secret
+  PORT=3000
+  NODE_ENV=development
+  ```
+</Step>
+
+<Step title="Install dependencies">
+  ```bash
+  npm install
+  ```
+</Step>
+
+<Step title="Apply database migrations">
+  ```bash
+  npm run db:migrate:up
+  ```
+</Step>
+
+<Step title="Start development server">
+  ```bash
+  npm run dev
+  ```
+  
+  This starts:
+  - Runner Dev portal on port 1337
+  - Fastify server on port 3000
+</Step>
+
+<Step title="Test the API">
+  ```bash
+  # Register
+  curl -X POST http://localhost:3000/auth/register \
+    -H 'content-type: application/json' \
+    -d '{"name":"Ada","email":"ada@example.com","password":"password"}'
+  
+  # Login
+  curl -X POST http://localhost:3000/auth/login \
+    -H 'content-type: application/json' \
+    -d '{"email":"ada@example.com","password":"password"}'
+  
+  # Get current user (with Bearer token)
+  TOKEN="<token-from-login>"
+  curl http://localhost:3000/me \
+    -H "Authorization: Bearer $TOKEN"
+  
+  # List users (admin only, with role header)
+  curl http://localhost:3000/users \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "x-user-role: admin"
+  ```
+</Step>
+
+</Steps>
+
+## Database Workflow
+
+```bash
+# Create a new migration after entity changes
+npm run db:migrate:create
+
+# Apply all pending migrations
+npm run db:migrate:up
+
+# Roll back the last migration
+npm run db:migrate:down
+```
+
+Migrations are written in TypeScript in `src/db/migrations/` and automatically compiled to `dist/db/migrations/`.
+
+## API Endpoints
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| GET | `/users` | Required + admin | List all users |
+| POST | `/auth/register` | Public | Create account |
+| POST | `/auth/login` | Public | Authenticate user |
+| POST | `/auth/logout` | Public | Clear auth cookie |
+| GET | `/me` | Required | Current user info |
+| GET | `/healthz` | Public | Liveness probe |
+| GET | `/readyz` | Public | DB readiness check |
+
+## What to Learn
+
+### 1. HTTP Pattern with Tags
+
+The `httpRoute` tag pattern separates HTTP concerns from business logic. Tasks remain framework-agnostic while the router handles all HTTP-specific details:
+
+- Input transformation (`body` vs `merged`)
+- Auth enforcement (`public`, `optional`, `required`)
+- Schema validation (Zod → Fastify schemas → OpenAPI)
+- Error handling (HTTPError → HTTP status codes)
+
+### 2. Request-Scoped Context
+
+Fastify context provides request-scoped data without prop drilling:
+
+```typescript
+const { request, reply, user, requestId, logger } = fastifyContext.use();
+```
+
+The router automatically populates this context for every request, including:
+- Parsed authentication (cookie or Bearer token)
+- Request-scoped logger with `requestId`
+- Access to raw Fastify request/reply objects
+
+### 3. Task Middleware
+
+Middleware intercepts task execution for cross-cutting concerns:
+
+```typescript
+middleware: [authorize.with({ roles: ["admin"] })]
+```
+
+Middleware can:
+- Enforce authorization rules
+- Log task execution
+- Transform inputs
+- Modify context
+
+### 4. ORM Integration
+
+MikroORM provides type-safe database access with migrations:
+
+```typescript
+const em = db.em(); // Request-scoped entity manager
+const user = await em.findOne(User, { email });
+em.persist(newUser);
+await em.flush();
+```
+
+### 5. Production Patterns
+
+- **Health checks**: `/healthz` (liveness), `/readyz` (DB connectivity)
+- **Security**: CORS, Helmet, HttpOnly cookies, HMAC tokens
+- **Observability**: Request IDs, structured logging, access logs
+- **Error handling**: Consistent error responses with proper HTTP codes
+
+### 6. Test Utilities
+
+The example includes helper functions for testing:
+
+```typescript
+const rr = await buildTestRunner({
+  register: [httpRoute, fastify, fastifyRouter, db, users],
+  overrides: [testOrmConfig], // In-memory SQLite
+});
+
+const res = await rr.http.inject({ 
+  method: "GET", 
+  url: "/users" 
+});
+```
+
+## Seeded Users
+
+Fixtures create demo users (password: `password`):
+
+- Ada Lovelace – `ada@example.test`
+- Alan Turing – `alan@example.test`
+- Grace Hopper – `grace@example.test`
+
+## Full Source
+
+View the complete example on GitHub:
+
+[github.com/bluelibs/runner/tree/main/examples/fastify-mikroorm](https://github.com/bluelibs/runner/tree/main/examples/fastify-mikroorm)

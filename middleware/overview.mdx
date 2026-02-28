@@ -1,0 +1,281 @@
+---
+title: Middleware Overview
+description: Add cross-cutting concerns to your tasks and resources with composable middleware
+---
+
+Middleware wraps around your tasks and resources, adding cross-cutting concerns like caching, retry logic, timeouts, and more—without cluttering your business logic.
+
+## What is Middleware?
+
+Middleware is a function that intercepts task or resource execution, allowing you to:
+
+- Add behavior before execution (validation, logging)
+- Modify or transform inputs
+- Add behavior after execution (caching, cleanup)
+- Handle errors (retry, circuit breaking)
+- Short-circuit execution (caching, rate limiting)
+
+Think of middleware as layers wrapped around your core logic, forming an "onion" where each layer can add functionality.
+
+## How Middleware Works
+
+Middleware runs in the order you define it, wrapping your task or resource:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const myTask = r
+  .task("app.tasks.example")
+  .middleware([
+    loggingMiddleware,    // Runs first (outer layer)
+    authMiddleware,       // Runs second
+    cachingMiddleware,    // Runs third (inner layer)
+  ])
+  .run(async (input) => {
+    // Your business logic runs last
+    return processData(input);
+  })
+  .build();
+```
+
+**Execution flow:**
+1. `loggingMiddleware` starts → logs "starting"
+2. `authMiddleware` starts → checks permissions
+3. `cachingMiddleware` starts → checks cache
+4. Your task runs → processes data
+5. `cachingMiddleware` ends → stores in cache
+6. `authMiddleware` ends
+7. `loggingMiddleware` ends → logs "completed"
+
+## Built-in Middleware
+
+Runner provides production-ready middleware out of the box:
+
+<CardGroup cols={2}>
+  <Card title="Retry" icon="rotate-right" href="/middleware/retry">
+    Automatically retry failed operations with exponential backoff
+  </Card>
+  <Card title="Timeout" icon="clock" href="/middleware/timeout">
+    Prevent operations from hanging indefinitely
+  </Card>
+  <Card title="Circuit Breaker" icon="circle-exclamation" href="/middleware/circuit-breaker">
+    Fail fast when downstream services are unavailable
+  </Card>
+  <Card title="Cache" icon="database" href="/middleware/cache">
+    Cache expensive operations with automatic invalidation
+  </Card>
+  <Card title="Rate Limit" icon="gauge-high" href="/middleware/rate-limit">
+    Limit execution frequency to prevent overload
+  </Card>
+  <Card title="Custom" icon="code" href="/middleware/custom">
+    Create your own middleware for specialized needs
+  </Card>
+</CardGroup>
+
+## Quick Example
+
+Here's how to add retry and timeout to an API call:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const callExternalAPI = r
+  .task("api.external")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 }),
+    globals.middleware.task.timeout.with({ ttl: 5000 }), // 5 second timeout
+  ])
+  .run(async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  })
+  .build();
+```
+
+This task will:
+- Retry up to 3 times on failure
+- Timeout after 5 seconds
+- Use exponential backoff between retries
+
+## Task vs Resource Middleware
+
+Middleware comes in two flavors:
+
+### Task Middleware
+
+Wraps task execution. Most built-in middleware (retry, cache, timeout) are task middleware.
+
+```typescript
+const taskMiddleware = r.middleware
+  .task("app.middleware.logging")
+  .run(async ({ task, next, journal }, deps, config) => {
+    console.log(`Task ${task.definition.id} starting`);
+    const result = await next(task.input);
+    console.log(`Task ${task.definition.id} completed`);
+    return result;
+  })
+  .build();
+```
+
+### Resource Middleware
+
+Wraps resource initialization. Useful for lifecycle management and configuration.
+
+```typescript
+const resourceMiddleware = r.middleware
+  .resource("app.middleware.monitoring")
+  .run(async ({ resource, next }, deps, config) => {
+    console.log(`Initializing ${resource.definition.id}`);
+    const value = await next(resource.config);
+    console.log(`Initialized ${resource.definition.id}`);
+    return value;
+  })
+  .build();
+```
+
+## Global Middleware
+
+Apply middleware to all tasks automatically:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const loggingMiddleware = r.middleware
+  .task("app.middleware.logging")
+  .everywhere(() => true) // Apply to all tasks
+  .dependencies({ logger: globals.resources.logger })
+  .run(async ({ task, next }, { logger }) => {
+    await logger.info(`Executing: ${task.definition.id}`);
+    const result = await next(task.input);
+    await logger.info(`Completed: ${task.definition.id}`);
+    return result;
+  })
+  .build();
+
+const app = r
+  .resource("app")
+  .register([loggingMiddleware]) // Automatically applies to all tasks
+  .build();
+```
+
+<Note>
+Global middleware can depend on resources or tasks. Any such dependencies are excluded from the middleware's execution to prevent infinite loops.
+</Note>
+
+## The Execution Journal
+
+Middleware can share state using the execution journal—a type-safe registry that travels with each execution:
+
+```typescript
+import { r, journal } from "@bluelibs/runner";
+
+// Define a typed key
+const traceIdKey = journal.createKey<string>("app.traceId");
+
+const traceMiddleware = r.middleware
+  .task("app.middleware.trace")
+  .run(async ({ task, next, journal }) => {
+    // Store trace ID for other middleware/tasks
+    journal.set(traceIdKey, `trace-${Date.now()}`);
+    return next(task.input);
+  })
+  .build();
+
+const myTask = r
+  .task("app.tasks.example")
+  .middleware([traceMiddleware])
+  .run(async (input, deps, { journal }) => {
+    // Read trace ID set by middleware
+    const traceId = journal.get(traceIdKey); // Fully typed!
+    console.log("Trace ID:", traceId);
+    return { success: true };
+  })
+  .build();
+```
+
+<Warning>
+By default, `journal.set()` throws if a key already exists. Use `{ override: true }` to intentionally update a value.
+</Warning>
+
+## Middleware Configuration
+
+Middleware can accept typed configuration:
+
+```typescript
+type AuthConfig = { requiredRole: string };
+
+const authMiddleware = r.middleware
+  .task("app.middleware.auth")
+  .run(async ({ task, next }, deps, config: AuthConfig) => {
+    if (task.input.user.role !== config.requiredRole) {
+      throw new Error("Insufficient permissions");
+    }
+    return next(task.input);
+  })
+  .build();
+
+// Apply with configuration
+const adminTask = r
+  .task("app.tasks.adminOnly")
+  .middleware([authMiddleware.with({ requiredRole: "admin" })])
+  .run(async (input) => "Secret admin data")
+  .build();
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Order matters">
+    Middleware runs in the order you define. Place logging/tracing first, caching last:
+    ```typescript
+    .middleware([
+      loggingMiddleware,  // First: logs everything
+      authMiddleware,     // Second: checks permissions
+      cacheMiddleware,    // Last: serves from cache if available
+    ])
+    ```
+  </Accordion>
+
+  <Accordion title="Use the journal for coordination">
+    Export journal keys so middleware can coordinate:
+    ```typescript
+    export const journalKeys = {
+      userId: journal.createKey<string>("auth.userId"),
+    };
+    ```
+  </Accordion>
+
+  <Accordion title="Keep middleware focused">
+    Each middleware should do one thing well. Combine multiple middleware instead of creating complex ones.
+  </Accordion>
+
+  <Accordion title="Handle errors appropriately">
+    Middleware can catch and transform errors:
+    ```typescript
+    try {
+      return await next(task.input);
+    } catch (error) {
+      // Log, transform, or rethrow
+      throw new CustomError("Operation failed", error);
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Retry Middleware" icon="rotate-right" href="/middleware/retry">
+    Handle transient failures automatically
+  </Card>
+  <Card title="Cache Middleware" icon="database" href="/middleware/cache">
+    Speed up expensive operations
+  </Card>
+  <Card title="Custom Middleware" icon="code" href="/middleware/custom">
+    Build your own middleware
+  </Card>
+  <Card title="Circuit Breaker" icon="circle-exclamation" href="/middleware/circuit-breaker">
+    Protect against cascading failures
+  </Card>
+</CardGroup>

@@ -1,0 +1,580 @@
+---
+title: Production Readiness Checklist
+description: Essential checks before deploying BlueLibs Runner applications to production
+---
+
+Use this checklist to ensure your Runner application is production-ready. These recommendations come from real-world deployments and cover security, reliability, observability, and operations.
+
+## Build and Runtime
+
+<AccordionGroup>
+  <Accordion title="Node.js Version" icon="node">
+    **Requirement:** Pin Node to a supported LTS line (`>=18`)
+
+    ```json
+    // package.json
+    {
+      "engines": {
+        "node": ">=18.0.0"
+      }
+    }
+    ```
+
+    **Why:** Runner requires Node.js 18+ for `fetch`, `AbortController`, and modern async features.
+
+    **Check:**
+    ```bash
+    node --version  # Should be 18.x or higher
+    ```
+  </Accordion>
+
+  <Accordion title="Build Validation" icon="check">
+    **Requirement:** Build in CI with `npm run qa`
+
+    ```yaml
+    # .github/workflows/ci.yml
+    - name: Quality Assurance
+      run: npm run qa
+    ```
+
+    **Why:** Catches type errors, linting issues, and test failures before deployment.
+
+    **What `npm run qa` does:**
+    - TypeScript type checking
+    - ESLint/Prettier validation
+    - Full test suite with 100% coverage enforcement
+  </Accordion>
+
+  <Accordion title="Compiled Output" icon="file-code">
+    **Requirement:** Run from compiled output (no ts-node in production)
+
+    ```json
+    // package.json
+    {
+      "scripts": {
+        "build": "tsup",
+        "start": "node dist/index.js"
+      }
+    }
+    ```
+
+    **Why:** ts-node adds significant startup time and memory overhead.
+
+    **Never do this in production:**
+    ```bash
+    # Bad - slow startup, high memory
+    ts-node src/index.ts
+
+    # Good - fast startup, optimized
+    node dist/index.js
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Security
+
+<Warning>
+  Security misconfigurations can expose your application to unauthorized access. Review these carefully.
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="Tunnel Authentication" icon="lock">
+    **Requirement:** Configure exposure auth for tunnels and avoid anonymous exposure
+
+    ```typescript
+    import { nodeExposure } from "@bluelibs/runner/node";
+
+    const exposure = nodeExposure("app.exposure", {
+      http: {
+        port: 3000,
+        auth: {
+          type: "bearer",
+          verify: async (token) => {
+            // Validate token against your auth system
+            return verifyToken(token);
+          },
+        },
+      },
+    });
+    ```
+
+    **Never expose without auth:**
+    ```typescript
+    // Bad - anyone can call your tasks
+    const exposure = nodeExposure("app.exposure", {
+      http: { port: 3000 },
+    });
+    ```
+  </Accordion>
+
+  <Accordion title="Task/Event Allow-lists" icon="list">
+    **Requirement:** Use allow-lists for remotely callable task/event ids
+
+    ```typescript
+    const exposure = nodeExposure("app.exposure", {
+      http: {
+        port: 3000,
+        allowTaskIds: [
+          "api.tasks.public.*",  // Public API tasks only
+          "api.tasks.user.get",
+        ],
+        allowEventIds: [
+          "api.events.public.*",
+        ],
+      },
+    });
+    ```
+
+    **Why:** Prevents accidental exposure of internal tasks/events.
+  </Accordion>
+
+  <Accordion title="Payload Limits" icon="gauge">
+    **Requirement:** Set payload limits for JSON/multipart traffic
+
+    ```typescript
+    const exposure = nodeExposure("app.exposure", {
+      http: {
+        port: 3000,
+        bodyLimit: 10 * 1024 * 1024, // 10MB max
+      },
+    });
+    ```
+
+    **Why:** Protects against denial-of-service attacks via large payloads.
+  </Accordion>
+
+  <Accordion title="Log Sanitization" icon="eraser">
+    **Requirement:** Review logs for sensitive data before enabling external sinks
+
+    ```typescript
+    import { globals } from "@bluelibs/runner";
+
+    const logger = globals.resources.logger;
+
+    // Bad - leaks sensitive data
+    await logger.info("User login", { password: user.password });
+
+    // Good - sanitized
+    await logger.info("User login", { userId: user.id });
+    ```
+
+    **Common sensitive fields to avoid logging:**
+    - Passwords, tokens, API keys
+    - Credit card numbers, SSNs
+    - Email addresses (in some jurisdictions)
+  </Accordion>
+</AccordionGroup>
+
+## Reliability
+
+<AccordionGroup>
+  <Accordion title="Timeout/Retry Defaults" icon="clock">
+    **Requirement:** Define timeout/retry/circuit-breaker defaults for external I/O tasks
+
+    ```typescript
+    import { r, globals } from "@bluelibs/runner";
+
+    const callExternalAPI = r
+      .task("api.external")
+      .middleware([
+        globals.middleware.task.timeout.with({ ttl: 5000 }),
+        globals.middleware.task.retry.with({ 
+          retries: 3,
+          delayStrategy: (attempt) => 100 * Math.pow(2, attempt),
+        }),
+        globals.middleware.task.circuitBreaker.with({
+          failureThreshold: 5,
+          resetTimeout: 30000,
+        }),
+      ])
+      .run(async (url: string) => {
+        return await fetch(url);
+      })
+      .build();
+    ```
+
+    **Why:** External services fail. Proper error handling prevents cascading failures.
+  </Accordion>
+
+  <Accordion title="Graceful Shutdown" icon="power-off">
+    **Requirement:** Verify graceful shutdown path with `SIGTERM` in staging
+
+    ```typescript
+    import { run } from "@bluelibs/runner";
+
+    const { dispose } = await run(app, {
+      shutdownHooks: true, // Auto-handle SIGINT/SIGTERM
+    });
+
+    // Manual shutdown
+    process.on("SIGTERM", async () => {
+      console.log("Received SIGTERM, shutting down gracefully...");
+      await dispose();
+      process.exit(0);
+    });
+    ```
+
+    **Test in staging:**
+    ```bash
+    # Start your app
+    node dist/index.js &
+    PID=$!
+
+    # Send SIGTERM
+    kill -TERM $PID
+
+    # Should see graceful shutdown logs
+    ```
+  </Accordion>
+
+  <Accordion title="Resource Disposal Order" icon="trash">
+    **Requirement:** Ensure resource disposal order is validated in integration tests
+
+    ```typescript
+    test("resources dispose in correct order", async () => {
+      const disposed: string[] = [];
+
+      const db = r
+        .resource("app.db")
+        .init(async () => ({ connected: true }))
+        .dispose(async () => { disposed.push("db"); })
+        .build();
+
+      const server = r
+        .resource("app.server")
+        .dependencies({ db })
+        .init(async () => ({ listening: true }))
+        .dispose(async () => { disposed.push("server"); })
+        .build();
+
+      const app = r.resource("app").register([db, server]).build();
+      const { dispose } = await run(app);
+      await dispose();
+
+      // Server depends on db, so server disposes first
+      expect(disposed).toEqual(["server", "db"]);
+    });
+    ```
+
+    **Why:** Incorrect disposal order can cause connection leaks or errors.
+  </Accordion>
+</AccordionGroup>
+
+## Observability
+
+<Note>
+  Without observability, you're flying blind in production. These are the baseline requirements.
+</Note>
+
+<AccordionGroup>
+  <Accordion title="Structured Logging" icon="file-lines">
+    **Requirement:** Emit structured logs with stable `source` ids
+
+    ```typescript
+    import { globals } from "@bluelibs/runner";
+
+    const processOrder = r
+      .task("orders.process")
+      .dependencies({ logger: globals.resources.logger })
+      .run(async (input, { logger }) => {
+        await logger.info("Processing order", {
+          data: {
+            orderId: input.orderId,
+            amount: input.amount,
+          },
+        });
+
+        try {
+          const result = await processPayment(input);
+          await logger.info("Order processed", {
+            data: { orderId: input.orderId, transactionId: result.id },
+          });
+          return result;
+        } catch (error) {
+          await logger.error("Order processing failed", {
+            error,
+            data: { orderId: input.orderId },
+          });
+          throw error;
+        }
+      })
+      .build();
+    ```
+
+    **Log format:**
+    - **timestamp**: ISO 8601
+    - **level**: debug/info/warn/error
+    - **source**: task/resource ID
+    - **data**: structured payload
+    - **error**: stack trace and details
+  </Accordion>
+
+  <Accordion title="Metrics Collection" icon="chart-line">
+    **Requirement:** Track latency and error-rate metrics per critical task path
+
+    ```typescript
+    import { globals } from "@bluelibs/runner";
+
+    const criticalTask = r
+      .task("critical.operation")
+      .dependencies({ 
+        logger: globals.resources.logger,
+        metrics: metricsResource, // Your metrics collector
+      })
+      .run(async (input, { logger, metrics }) => {
+        const start = Date.now();
+        try {
+          const result = await doWork(input);
+          metrics.histogram("critical.operation.duration", Date.now() - start);
+          metrics.increment("critical.operation.success");
+          return result;
+        } catch (error) {
+          metrics.increment("critical.operation.error");
+          throw error;
+        }
+      })
+      .build();
+    ```
+
+    **Key metrics to track:**
+    - Request rate (requests/second)
+    - Error rate (errors/second)
+    - Latency (p50, p95, p99)
+    - Task execution time
+  </Accordion>
+
+  <Accordion title="Distributed Tracing" icon="diagram-project">
+    **Requirement:** Export traces for cross-service flows
+
+    ```typescript
+    import { r } from "@bluelibs/runner";
+
+    const tracingMiddleware = r.middleware.task
+      .configurable<{ serviceName: string }>()
+      .run(async (config, input, { next }) => {
+        const traceId = input.traceId || generateTraceId();
+        const span = tracer.startSpan(config.serviceName, { traceId });
+        
+        try {
+          const result = await next({ ...input, traceId });
+          span.finish();
+          return result;
+        } catch (error) {
+          span.setTag("error", true);
+          span.log({ error: error.message });
+          span.finish();
+          throw error;
+        }
+      })
+      .build();
+
+    const myTask = r
+      .task("service.operation")
+      .middleware([tracingMiddleware.with({ serviceName: "my-service" })])
+      .run(async (input) => {
+        // Operation is traced automatically
+      })
+      .build();
+    ```
+  </Accordion>
+
+  <Accordion title="Baseline Alerts" icon="bell">
+    **Requirement:** Configure baseline alerts for error-rate spikes and sustained p95 latency
+
+    **Example alert rules:**
+
+    | Metric | Threshold | Duration | Action |
+    |--------|-----------|----------|--------|
+    | Error rate | > 5% | 5 minutes | Page on-call |
+    | p95 latency | > 1000ms | 10 minutes | Notify team |
+    | Availability | < 99.9% | 5 minutes | Page on-call |
+    | Memory usage | > 85% | 5 minutes | Auto-scale or alert |
+
+    **Common alerting platforms:**
+    - Datadog
+    - Prometheus + Alertmanager
+    - New Relic
+    - Sentry
+  </Accordion>
+</AccordionGroup>
+
+## Operations
+
+<AccordionGroup>
+  <Accordion title="Health Checks" icon="heartbeat">
+    **Requirement:** Expose `/health` (or equivalent) and wire container/platform checks
+
+    ```typescript
+    import express from "express";
+    import { r, run } from "@bluelibs/runner";
+
+    const healthCheck = r
+      .task("app.health")
+      .dependencies({ db, cache })
+      .run(async (_, { db, cache }) => {
+        // Check critical dependencies
+        const dbHealthy = await db.ping();
+        const cacheHealthy = await cache.ping();
+
+        if (!dbHealthy || !cacheHealthy) {
+          throw new Error("Unhealthy");
+        }
+
+        return {
+          status: "healthy",
+          timestamp: new Date().toISOString(),
+          dependencies: {
+            db: dbHealthy ? "up" : "down",
+            cache: cacheHealthy ? "up" : "down",
+          },
+        };
+      })
+      .build();
+
+    const server = r
+      .resource("app.server")
+      .dependencies({ healthCheck })
+      .init(async (_, { healthCheck }) => {
+        const app = express();
+        
+        app.get("/health", async (req, res) => {
+          try {
+            const health = await healthCheck.run({}, {});
+            res.json(health);
+          } catch (error) {
+            res.status(503).json({ status: "unhealthy", error: error.message });
+          }
+        });
+
+        const listener = app.listen(3000);
+        return { app, listener };
+      })
+      .build();
+    ```
+  </Accordion>
+
+  <Accordion title="Runbooks" icon="book">
+    **Requirement:** Maintain runbooks for incident triage and rollback
+
+    **Example runbook structure:**
+
+    ```markdown
+    # Runbook: High Error Rate
+
+    ## Symptoms
+    - Error rate > 5%
+    - Users reporting failures
+    - Alerts firing
+
+    ## Triage Steps
+    1. Check recent deployments
+    2. Review error logs
+    3. Check external service status
+    4. Verify database connectivity
+
+    ## Mitigation
+    1. Rollback to previous version
+    2. Scale up resources
+    3. Enable circuit breakers
+
+    ## Rollback Procedure
+    ```bash
+    # Rollback to previous deployment
+    kubectl rollout undo deployment/my-app
+
+    # Or with your deployment tool
+    pm2 reload my-app --update-env
+    ```
+
+    ## Escalation
+    - On-call: #oncall-team
+    - Engineering lead: @lead
+    - Incident commander: @ic
+    ```
+  </Accordion>
+
+  <Accordion title="Release Review" icon="clipboard-check">
+    **Requirement:** Review release notes before upgrades and test migrations in staging
+
+    **Upgrade process:**
+
+    1. **Review release notes:**
+       - Check [GitHub Releases](https://github.com/bluelibs/runner/releases)
+       - Look for breaking changes
+       - Read migration guides
+
+    2. **Test in staging:**
+       ```bash
+       # Update to new version
+       npm install @bluelibs/runner@latest
+
+       # Run tests
+       npm run qa
+
+       # Deploy to staging
+       deploy staging
+
+       # Run integration tests
+       npm run test:integration
+
+       # Monitor for 24 hours
+       ```
+
+    3. **Production deployment:**
+       - Deploy during low-traffic window
+       - Use canary or blue-green deployment
+       - Monitor metrics closely
+       - Have rollback plan ready
+  </Accordion>
+</AccordionGroup>
+
+## Deployment Checklist
+
+Use this final checklist before promoting to production:
+
+| Category | Check | Status |
+|----------|-------|--------|
+| **Build** | Node.js >= 18 | [ ] |
+| **Build** | CI runs `npm run qa` | [ ] |
+| **Build** | Using compiled output (not ts-node) | [ ] |
+| **Security** | Tunnel auth configured | [ ] |
+| **Security** | Task/event allow-lists defined | [ ] |
+| **Security** | Payload limits set | [ ] |
+| **Security** | Logs sanitized | [ ] |
+| **Reliability** | Timeout/retry configured | [ ] |
+| **Reliability** | Graceful shutdown tested | [ ] |
+| **Reliability** | Resource disposal order validated | [ ] |
+| **Observability** | Structured logging enabled | [ ] |
+| **Observability** | Metrics collection configured | [ ] |
+| **Observability** | Distributed tracing enabled | [ ] |
+| **Observability** | Alerts configured | [ ] |
+| **Operations** | Health check endpoint exposed | [ ] |
+| **Operations** | Runbooks documented | [ ] |
+| **Operations** | Release notes reviewed | [ ] |
+
+## Support and SLAs
+
+For enterprise deployments with SLA requirements, see the [Enterprise Support](/guides/production-readiness) guide.
+
+**Current support channels:**
+- **Stable:** `5.x` (current feature line)
+- **Maintenance/LTS:** `4.x` (critical fixes only)
+
+**Security contact:** theodor@bluelibs.com
+
+## Additional Resources
+
+<CardGroup cols={2}>
+  <Card title="Observability Strategy" icon="chart-mixed" href="/guides/observability">
+    Detailed guide on logs, metrics, and traces
+  </Card>
+  <Card title="Enterprise Support" icon="building" href="/guides/production-readiness">
+    Professional and enterprise support plans
+  </Card>
+  <Card title="Migration Guide" icon="arrow-right" href="/guides/migration">
+    Upgrading between Runner versions
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/guides/troubleshooting">
+    Common issues and solutions
+  </Card>
+</CardGroup>

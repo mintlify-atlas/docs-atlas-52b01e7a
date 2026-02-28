@@ -1,0 +1,423 @@
+---
+title: Multi-Platform Support
+description: Running BlueLibs Runner across Node.js, browsers, and edge runtimes
+---
+
+BlueLibs Runner works seamlessly across Node.js, browsers, and edge workers through a platform adapter system that abstracts runtime differences behind a unified interface.
+
+## Platform Support Matrix
+
+| Capability | Node.js | Browser | Edge Workers | Notes |
+|------------|---------|---------|--------------|-------|
+| Core runtime (tasks/resources/middleware/events/hooks) | Full | Full | Full | Platform adapters hide runtime differences |
+| Async Context (`r.asyncContext`) | Full | None | None | Requires Node.js `AsyncLocalStorage` |
+| Durable workflows (`@bluelibs/runner/node`) | Full | None | None | Node-only module |
+| Tunnels client (`createHttpClient`) | Full | Full | Full | Requires `fetch` |
+| Tunnels server (`@bluelibs/runner/node`) | Full | None | None | Exposes tasks/events over HTTP |
+
+## The Platform Adapter System
+
+Runner uses platform adapters to translate runtime-specific features into a common interface. This means your application code stays the same whether you're running in Node.js, a browser, or an edge worker.
+
+### The Core Interface
+
+Every platform adapter implements `IPlatformAdapter`:
+
+```typescript
+interface IPlatformAdapter {
+  // Process management
+  onUncaughtException(handler: (error: Error) => void): () => void;
+  onUnhandledRejection(handler: (reason: unknown) => void): () => void;
+  onShutdownSignal(handler: () => void): () => void;
+  exit(code: number): void;
+
+  // Environment access
+  getEnv(key: string): string | undefined;
+
+  // Async context tracking (Node.js only)
+  hasAsyncLocalStorage(): boolean;
+  createAsyncLocalStorage<T>(): IAsyncLocalStorage<T>;
+
+  // Timers (universal)
+  setTimeout: typeof globalThis.setTimeout;
+  clearTimeout: typeof globalThis.clearTimeout;
+
+  // Initialization hook
+  init(): Promise<void>;
+}
+```
+
+## Environment Detection
+
+Runner automatically detects your runtime environment:
+
+```typescript
+export function detectEnvironment(): PlatformId {
+  // Browser: has window and document
+  if (typeof window !== "undefined" && typeof document !== "undefined") {
+    return "browser";
+  }
+
+  // Node.js: has process.versions.node
+  if (global.process?.versions?.node) {
+    return "node";
+  }
+
+  // Deno: has global Deno object
+  if (typeof global.Deno !== "undefined") {
+    return "universal";
+  }
+
+  // Bun: has process.versions.bun
+  if (typeof global.Bun !== "undefined" || global.process?.versions?.bun) {
+    return "universal";
+  }
+
+  // Edge/Worker environments
+  if (
+    typeof global.importScripts === "function" &&
+    typeof window === "undefined"
+  ) {
+    return "edge";
+  }
+
+  return "universal";
+}
+```
+
+## Platform-Specific Adapters
+
+### NodePlatformAdapter
+
+Provides full Node.js capabilities:
+
+- Real process control with `process.exit()`
+- Signal handling (SIGINT, SIGTERM)
+- Native `AsyncLocalStorage` for request-scoped state
+- Full environment variable access
+
+```typescript
+export class NodePlatformAdapter implements IPlatformAdapter {
+  onUncaughtException(handler) {
+    process.on("uncaughtException", handler);
+    return () => process.off("uncaughtException", handler);
+  }
+
+  onShutdownSignal(handler) {
+    process.on("SIGINT", handler);
+    process.on("SIGTERM", handler);
+    return () => {
+      process.off("SIGINT", handler);
+      process.off("SIGTERM", handler);
+    };
+  }
+
+  exit(code: number) {
+    process.exit(code);
+  }
+
+  hasAsyncLocalStorage() {
+    return true;
+  }
+}
+```
+
+### BrowserPlatformAdapter
+
+Translates browser concepts to the platform interface:
+
+- Maps `window.error` events to uncaught exceptions
+- Uses `beforeunload` and `visibilitychange` for shutdown signals
+- Cannot exit (throws `PlatformUnsupportedFunction`)
+- No `AsyncLocalStorage` support
+
+```typescript
+export class BrowserPlatformAdapter implements IPlatformAdapter {
+  onUncaughtException(handler) {
+    const target = window ?? globalThis;
+    const h = (e) => handler(e?.error ?? e);
+    target.addEventListener("error", h);
+    return () => target.removeEventListener("error", h);
+  }
+
+  onShutdownSignal(handler) {
+    window.addEventListener("beforeunload", handler);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") handler();
+    });
+    return () => {
+      window.removeEventListener("beforeunload", handler);
+    };
+  }
+
+  exit() {
+    throw new PlatformUnsupportedFunction("exit");
+  }
+
+  hasAsyncLocalStorage() {
+    return false;
+  }
+}
+```
+
+### EdgePlatformAdapter
+
+Minimal adapter for edge workers:
+
+- Even more constrained than browsers
+- No reliable shutdown signals
+- Inherits most browser behavior
+
+```typescript
+export class EdgePlatformAdapter extends BrowserPlatformAdapter {
+  onShutdownSignal(handler) {
+    return () => {}; // No reliable shutdown signal in edge workers
+  }
+}
+```
+
+## Build-Time Optimization
+
+Runner optimizes at build time using different entry points:
+
+### Package.json Exports
+
+```json
+{
+  "exports": {
+    ".": {
+      "browser": {
+        "import": "./dist/browser/index.mjs",
+        "require": "./dist/browser/index.cjs"
+      },
+      "node": {
+        "import": "./dist/node/node.mjs",
+        "require": "./dist/node/node.cjs"
+      },
+      "import": "./dist/universal/index.mjs",
+      "require": "./dist/universal/index.cjs",
+      "default": "./dist/universal/index.mjs"
+    }
+  }
+}
+```
+
+<Note>
+Node.js bundlers automatically receive the Node-optimized bundle when you import from `@bluelibs/runner`, while browsers and universal runtimes get the appropriate builds with runtime detection.
+</Note>
+
+### Factory with Build-Time Constants
+
+The adapter factory uses build-time constants to eliminate runtime detection when possible:
+
+```typescript
+export function createPlatformAdapter(): IPlatformAdapter {
+  if (typeof __TARGET__ !== "undefined") {
+    switch (__TARGET__) {
+      case "node":
+        return new NodePlatformAdapter();
+      case "browser":
+        return new BrowserPlatformAdapter();
+      case "edge":
+        return new EdgePlatformAdapter();
+    }
+  }
+  // Fallback to runtime detection
+  return new UniversalPlatformAdapter();
+}
+```
+
+## Platform-Specific Features
+
+### Async Context (Node.js Only)
+
+Request-scoped state requires Node.js `AsyncLocalStorage`:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const requestContext = r
+  .asyncContext<{ requestId: string }>("app.ctx.request")
+  .build();
+
+const app = r
+  .resource("app")
+  .register([requestContext])
+  .build();
+```
+
+<Warning>
+Async context only works in Node.js. Browser and edge environments will throw `PlatformUnsupportedFunction` when attempting to use async context.
+</Warning>
+
+### Durable Workflows (Node.js Only)
+
+Persistent, crash-recoverable workflows require Node.js:
+
+```typescript
+import { memoryDurableResource } from "@bluelibs/runner/node";
+
+const durable = memoryDurableResource("app.durable");
+
+const workflow = r
+  .task("app.workflows.process")
+  .dependencies({ durable })
+  .run(async (input, { durable }) => {
+    return await durable.execute("order-123", async (ctx) => {
+      const result = await ctx.step("step1", async () => {
+        return await processOrder(input);
+      });
+      return result;
+    });
+  })
+  .build();
+```
+
+See the [Durable Workflows](/node/durable-workflows) guide for details.
+
+### HTTP Tunnels
+
+**Server (Node.js only):**
+
+```typescript
+import { nodeExposure } from "@bluelibs/runner/node";
+
+const exposure = nodeExposure("app.exposure", {
+  http: {
+    port: 3000,
+    allowTaskIds: ["app.tasks.*"],
+    allowEventIds: ["app.events.*"],
+  },
+});
+
+const app = r
+  .resource("app")
+  .register([exposure, myTask])
+  .build();
+```
+
+**Client (Universal - works everywhere with `fetch`):**
+
+```typescript
+import { createHttpClient } from "@bluelibs/runner";
+
+const client = createHttpClient("http://localhost:3000");
+const result = await client.runTask("app.tasks.process", { data: "input" });
+```
+
+See the [HTTP Tunnels](/node/http-tunnels) guide for details.
+
+## Graceful Degradation
+
+When a feature isn't available on a platform, Runner throws informative errors:
+
+```typescript
+// In browser or edge environment
+try {
+  requestContext.getStore();
+} catch (error) {
+  // PlatformUnsupportedFunction: "AsyncLocalStorage is not available"
+  // on this platform (browser/edge). Use Node.js for async context.
+}
+```
+
+## Adding New Platforms
+
+To support a new runtime, implement the `IPlatformAdapter` interface:
+
+```typescript
+export class DenoEdgePlatformAdapter implements IPlatformAdapter {
+  async init() {
+    // Deno-specific initialization
+  }
+
+  onUncaughtException(handler) {
+    globalThis.addEventListener("error", handler);
+    return () => globalThis.removeEventListener("error", handler);
+  }
+
+  getEnv(key: string) {
+    return Deno.env.get(key);
+  }
+
+  // ... implement remaining methods
+}
+```
+
+Then add it to the detection logic and build configuration.
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Write platform-agnostic code by default">
+    Use core Runner features (tasks, resources, middleware, events) which work everywhere. Only use platform-specific features when necessary.
+  </Accordion>
+
+  <Accordion title="Check platform support early">
+    If your app requires Node.js-specific features, validate at startup:
+
+    ```typescript
+    const platform = detectEnvironment();
+    if (platform !== "node") {
+      throw new Error("This app requires Node.js");
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Use conditional imports for Node-only code">
+    ```typescript
+    // Only import Node-specific modules when needed
+    if (typeof process !== "undefined") {
+      const { nodeExposure } = await import("@bluelibs/runner/node");
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Test on your target platforms">
+    Run your test suite in Node.js, browsers (via Vitest/Jest with jsdom), and edge worker simulators to catch platform-specific issues early.
+  </Accordion>
+</AccordionGroup>
+
+## Testing Multi-Platform Code
+
+Runner achieves 100% test coverage across all platform adapters:
+
+```typescript
+// Node.js paths: default Jest node environment
+test("Node adapter handles shutdown signals", async () => {
+  const adapter = new NodePlatformAdapter();
+  const handler = jest.fn();
+  const dispose = adapter.onShutdownSignal(handler);
+  
+  process.emit("SIGTERM");
+  expect(handler).toHaveBeenCalled();
+  dispose();
+});
+
+// Browser paths: use @jest-environment jsdom
+/**
+ * @jest-environment jsdom
+ */
+test("Browser adapter handles window errors", () => {
+  const adapter = new BrowserPlatformAdapter();
+  const handler = jest.fn();
+  const dispose = adapter.onUncaughtException(handler);
+  
+  window.dispatchEvent(new ErrorEvent("error", { error: new Error("test") }));
+  expect(handler).toHaveBeenCalled();
+  dispose();
+});
+```
+
+<Card title="Universal Runtime Testing" icon="vial">
+  Test the universal adapter by simulating globals as needed, ensuring each platform path exercises the correct delegation.
+</Card>
+
+## Key Takeaways
+
+- Runner's core features work across Node.js, browsers, and edge workers
+- Platform adapters abstract runtime differences behind a unified interface
+- Node.js-specific features (async context, durable workflows, HTTP exposure) require the Node.js runtime
+- Tunnel clients work everywhere with `fetch`, but servers require Node.js
+- Build-time optimization delivers smaller bundles for specific platforms
+- Graceful degradation provides clear error messages when features aren't available

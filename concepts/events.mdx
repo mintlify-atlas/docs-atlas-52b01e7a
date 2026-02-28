@@ -1,0 +1,407 @@
+---
+title: Events
+description: Typed message system for decoupled communication
+---
+
+## What Are Events?
+
+Events are **typed signals** that tell your application "something happened." They decouple parts of your app so they can communicate without tight coupling.
+
+Think of events as announcements: "User registered!" or "Order completed!" Other parts of your app can listen for these announcements and react accordingly, without the emitter knowing or caring who's listening.
+
+## Why Use Events?
+
+Events solve the problem of **tight coupling**. Without events, your code looks like this:
+
+```typescript Bad: Tightly Coupled
+const createUser = async (data) => {
+  const user = await db.users.insert(data);
+  await emailService.sendWelcome(user.email); // Coupled!
+  await analyticsService.track("user.created", user); // Coupled!
+  await slackService.notify(`New user: ${user.email}`); // Coupled!
+  return user;
+};
+```
+
+With events, you **decouple** the core logic from the side effects:
+
+```typescript Good: Decoupled with Events
+const createUser = async (data) => {
+  const user = await db.users.insert(data);
+  await emitUserCreated({ userId: user.id, email: user.email });
+  return user;
+};
+
+// Elsewhere: listeners react independently
+onUserCreated((event) => emailService.sendWelcome(event.data.email));
+onUserCreated((event) => analyticsService.track("user.created", event.data));
+onUserCreated((event) => slackService.notify(`New user: ${event.data.email}`));
+```
+
+<Note>
+Now `createUser` doesn't know about email, analytics, or Slack. You can add/remove listeners without touching the core logic.
+</Note>
+
+## Creating Events
+
+Define an event with a unique ID and a payload schema:
+
+```typescript
+import { r } from "@bluelibs/runner";
+import { z } from "zod";
+
+const userRegistered = r
+  .event("app.events.userRegistered")
+  .payloadSchema(
+    z.object({
+      userId: z.string(),
+      email: z.string().email(),
+    })
+  )
+  .build();
+```
+
+<Steps>
+  <Step title="Create the event">
+    Use `r.event(id)` with a unique namespaced ID like `"app.events.userRegistered"`.
+  </Step>
+  <Step title="Add a payload schema (optional)">
+    Call `.payloadSchema(zodSchema)` to validate the event payload at runtime.
+  </Step>
+  <Step title="Build it">
+    Call `.build()` to finalize the event definition.
+  </Step>
+</Steps>
+
+<Tip>
+You can also use a type-only event without runtime validation:
+
+```typescript
+const userRegistered = r
+  .event<{ userId: string; email: string }>("app.events.userRegistered")
+  .build();
+```
+</Tip>
+
+## Emitting Events from Tasks
+
+To emit an event, add it as a dependency and call it like a function:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const registerUser = r
+  .task("app.tasks.registerUser")
+  .dependencies({ userRegistered, db })
+  .run(async (input, { userRegistered, db }) => {
+    const user = await db.users.insert(input);
+    
+    // Emit the event
+    await userRegistered({ userId: user.id, email: user.email });
+    
+    return user;
+  })
+  .build();
+```
+
+<Note>
+Emitting an event is **asynchronous**. It runs all registered hooks in order before returning.
+</Note>
+
+## Listening to Events with Hooks
+
+Use **hooks** to react to events. Hooks are lightweight event subscribers:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const sendWelcomeEmail = r
+  .hook("app.hooks.sendWelcomeEmail")
+  .on(userRegistered)
+  .dependencies({ mailer })
+  .run(async (event, { mailer }) => {
+    await mailer.send({
+      to: event.data.email,
+      subject: "Welcome!",
+      body: "Thanks for joining!",
+    });
+  })
+  .build();
+
+const trackAnalytics = r
+  .hook("app.hooks.trackAnalytics")
+  .on(userRegistered)
+  .dependencies({ analytics })
+  .run(async (event, { analytics }) => {
+    await analytics.track("user.registered", {
+      userId: event.data.userId,
+      email: event.data.email,
+    });
+  })
+  .build();
+```
+
+<Steps>
+  <Step title="Create a hook">
+    Use `r.hook(id)` with a unique namespaced ID.
+  </Step>
+  <Step title="Specify which event to listen to">
+    Call `.on(event)` to specify which event triggers this hook.
+  </Step>
+  <Step title="Add dependencies">
+    Use `.dependencies({ ... })` to inject services the hook needs.
+  </Step>
+  <Step title="Define the handler">
+    Call `.run(async (event, deps) => { ... })` to define what happens when the event fires.
+  </Step>
+  <Step title="Build and register">
+    Build the hook and register it in your app resource.
+  </Step>
+</Steps>
+
+## Hook Execution Order
+
+Hooks execute in **order of registration** by default. You can control the order explicitly:
+
+```typescript
+const criticalHook = r
+  .hook("app.hooks.critical")
+  .on(userRegistered)
+  .order(1) // Runs first
+  .run(async (event) => {
+    console.log("Critical hook");
+  })
+  .build();
+
+const normalHook = r
+  .hook("app.hooks.normal")
+  .on(userRegistered)
+  .order(10) // Runs later
+  .run(async (event) => {
+    console.log("Normal hook");
+  })
+  .build();
+```
+
+<Tip>
+**Lower numbers run first**. Use this to ensure critical hooks (like saving to the database) run before optional hooks (like sending notifications).
+</Tip>
+
+## Parallel Event Execution
+
+By default, hooks run **sequentially**. For performance, you can enable **parallel execution**:
+
+```typescript
+const userRegistered = r
+  .event("app.events.userRegistered")
+  .parallel(true) // Enable parallel execution
+  .build();
+```
+
+With `.parallel(true)`:
+- Hooks with the **same order** run concurrently
+- Different order groups run sequentially
+- If one hook fails, the entire batch completes, then an `AggregateError` is thrown
+
+<Note>
+Use parallel execution for independent side effects (analytics, notifications) but keep it sequential for dependent operations (database writes, state updates).
+</Note>
+
+## Stopping Event Propagation
+
+Hooks can **stop propagation** to prevent downstream hooks from running:
+
+```typescript
+const validateUserHook = r
+  .hook("app.hooks.validateUser")
+  .on(userRegistered)
+  .order(1)
+  .run(async (event) => {
+    if (!isValidEmail(event.data.email)) {
+      event.stopPropagation(); // Stop other hooks from running
+      throw new Error("Invalid email");
+    }
+  })
+  .build();
+```
+
+<Tip>
+Use `event.stopPropagation()` for validation hooks or circuit breakers that should halt processing on failure.
+</Tip>
+
+## Wildcard Hooks: Listen to Everything
+
+You can create a **wildcard hook** that listens to **all events**:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const auditAllEvents = r
+  .hook("app.hooks.auditAllEvents")
+  .on("*") // Wildcard: listen to all events
+  .dependencies({ logger: globals.resources.logger })
+  .run(async (event, { logger }) => {
+    await logger.info(`Event emitted: ${event.definition.id}`, {
+      data: event.data,
+    });
+  })
+  .build();
+```
+
+<Note>
+**Exclude events from wildcard hooks**: Tag events with `globals.tags.excludeFromGlobalHooks` to prevent them from triggering wildcard hooks.
+</Note>
+
+## Error Handling in Events
+
+Control how errors are handled during event emission:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const registerUser = r
+  .task("app.tasks.registerUser")
+  .dependencies({ userRegistered })
+  .run(async (input, { userRegistered }) => {
+    const user = await db.users.insert(input);
+    
+    // Option 1: Fail fast (default)
+    await userRegistered({ userId: user.id, email: user.email });
+    
+    // Option 2: Aggregate errors and continue
+    await userRegistered(
+      { userId: user.id, email: user.email },
+      {
+        failureMode: "aggregate",
+        throwOnError: false,
+        report: true,
+      }
+    );
+    
+    return user;
+  })
+  .build();
+```
+
+<CodeGroup>
+
+```typescript Fail Fast (Default)
+// Throws immediately when a hook fails
+await userRegistered(payload);
+```
+
+```typescript Aggregate Errors
+// Runs all hooks, then throws AggregateError
+await userRegistered(payload, {
+  failureMode: "aggregate",
+});
+```
+
+```typescript Get Report
+// Returns a report instead of throwing
+const report = await userRegistered(payload, {
+  report: true,
+  throwOnError: false,
+});
+console.log(report.failedListeners);
+```
+
+</CodeGroup>
+
+## Real-World Example: User Registration Flow
+
+Here's a complete example showing events, hooks, and tasks working together:
+
+```typescript src/users/events.ts
+import { r } from "@bluelibs/runner";
+import { z } from "zod";
+
+export const userRegistered = r
+  .event("app.events.userRegistered")
+  .payloadSchema(
+    z.object({
+      userId: z.string(),
+      email: z.string().email(),
+    })
+  )
+  .build();
+```
+
+```typescript src/users/tasks/register.task.ts
+import { r } from "@bluelibs/runner";
+import { userRegistered } from "../events";
+
+export const registerUser = r
+  .task("app.tasks.registerUser")
+  .dependencies({ db, userRegistered })
+  .run(async (input, { db, userRegistered }) => {
+    const user = await db.users.insert(input);
+    await userRegistered({ userId: user.id, email: user.email });
+    return user;
+  })
+  .build();
+```
+
+```typescript src/notifications/hooks/welcome-email.hook.ts
+import { r } from "@bluelibs/runner";
+import { userRegistered } from "../../users/events";
+
+export const sendWelcomeEmail = r
+  .hook("app.hooks.sendWelcomeEmail")
+  .on(userRegistered)
+  .dependencies({ mailer })
+  .run(async (event, { mailer }) => {
+    await mailer.send({
+      to: event.data.email,
+      subject: "Welcome!",
+      body: "Thanks for joining our platform!",
+    });
+  })
+  .build();
+```
+
+```typescript src/analytics/hooks/track-registration.hook.ts
+import { r } from "@bluelibs/runner";
+import { userRegistered } from "../../users/events";
+
+export const trackRegistration = r
+  .hook("app.hooks.trackRegistration")
+  .on(userRegistered)
+  .dependencies({ analytics })
+  .run(async (event, { analytics }) => {
+    await analytics.track("user.registered", {
+      userId: event.data.userId,
+    });
+  })
+  .build();
+```
+
+<Tip>
+**Clean architecture**: Notice how the `registerUser` task knows nothing about emails or analytics. Those concerns live in separate hooks, making the code easier to test and maintain.
+</Tip>
+
+## Best Practices
+
+<Steps>
+  <Step title="Use descriptive IDs">
+    Follow the pattern `domain.events.eventName` (e.g., `"users.events.registered"`, `"orders.events.completed"`).
+  </Step>
+  <Step title="Keep payloads minimal">
+    Only include data that listeners need. Avoid embedding entire entities.
+  </Step>
+  <Step title="Validate payloads">
+    Use `.payloadSchema()` to catch payload errors early.
+  </Step>
+  <Step title="Name events in past tense">
+    Events describe things that already happened: `userRegistered`, not `registerUser`.
+  </Step>
+  <Step title="Don't overuse events">
+    Use events for decoupling, not for every function call. If components are tightly coupled by design, use direct dependencies.
+  </Step>
+</Steps>
+
+## Related Concepts
+
+- [Hooks](/concepts/hooks) - Lightweight event subscribers
+- [Tasks](/concepts/tasks) - Tasks emit events and can be triggered by hooks
+- [Lifecycle](/concepts/lifecycle) - Built-in lifecycle events like `ready` and `shutdown`

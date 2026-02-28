@@ -1,0 +1,526 @@
+---
+title: Cache Middleware
+description: Speed up expensive operations with automatic caching and TTL-based invalidation
+---
+
+The cache middleware stores task results in memory, serving subsequent requests instantly without re-executing the task. It's perfect for expensive operations that return the same result for the same input.
+
+## When to Use Cache
+
+<CardGroup cols={2}>
+  <Card title="Database queries" icon="database">
+    Cache expensive database lookups
+  </Card>
+  <Card title="API calls" icon="cloud">
+    Avoid redundant external requests
+  </Card>
+  <Card title="Computations" icon="calculator">
+    Store results of heavy calculations
+  </Card>
+  <Card title="User sessions" icon="user">
+    Cache user profile data
+  </Card>
+</CardGroup>
+
+## Quick Start
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const getUser = r
+  .task("users.get")
+  .middleware([
+    globals.middleware.task.cache.with({
+      ttl: 60 * 1000, // Cache for 1 minute
+    })
+  ])
+  .run(async (userId: string) => {
+    return database.users.findOne({ id: userId });
+  })
+  .build();
+```
+
+The first call fetches from the database. Subsequent calls within 1 minute are served from cache instantly.
+
+## Configuration
+
+<ParamField path="ttl" type="number" default="10000">
+  Time-to-live in milliseconds. Cached entries are automatically purged after this duration.
+  
+  **Default:** 10 seconds
+</ParamField>
+
+<ParamField path="max" type="number" default="100">
+  Maximum number of items to store in the cache. When exceeded, least recently used (LRU) items are evicted.
+</ParamField>
+
+<ParamField path="ttlAutopurge" type="boolean" default="true">
+  Automatically remove expired entries from the cache.
+</ParamField>
+
+<ParamField path="keyBuilder" type="(taskId: string, input: unknown) => string" default="Auto-generated">
+  Custom function to generate cache keys from task input.
+  
+  **Default:** `taskId + JSON.stringify(input)`
+</ParamField>
+
+## Examples
+
+### Basic Caching
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const fetchUserProfile = r
+  .task("users.profile")
+  .middleware([
+    globals.middleware.task.cache.with({ 
+      ttl: 5 * 60 * 1000 // Cache for 5 minutes
+    })
+  ])
+  .run(async (userId: string) => {
+    return database.users.findOne({ id: userId });
+  })
+  .build();
+```
+
+### Custom Cache Key
+
+By default, the cache key includes the entire input object. For complex inputs, create a custom key:
+
+```typescript
+const searchProducts = r
+  .task("products.search")
+  .middleware([
+    globals.middleware.task.cache.with({
+      ttl: 60000,
+      keyBuilder: (taskId, input: { query: string; filters?: object }) => {
+        // Only cache based on query, ignore filters
+        return `${taskId}:${input.query}`;
+      }
+    })
+  ])
+  .run(async (input: { query: string; filters?: object }) => {
+    return searchEngine.search(input.query, input.filters);
+  })
+  .build();
+```
+
+<Note>
+The `keyBuilder` receives the deserialized input. Ensure your key function handles all relevant input fields.
+</Note>
+
+### Cache Size Limits
+
+Control memory usage with the `max` parameter:
+
+```typescript
+const cachedTask = r
+  .task("api.cached")
+  .middleware([
+    globals.middleware.task.cache.with({
+      ttl: 3600000,  // 1 hour
+      max: 1000,     // Store at most 1000 items
+    })
+  ])
+  .run(async (input) => expensiveOperation(input))
+  .build();
+```
+
+When the cache reaches 1000 items, the least recently used (LRU) item is evicted to make room.
+
+### Different TTLs for Different Operations
+
+```typescript
+// Frequently changing data: short TTL
+const getLiveStats = r
+  .task("stats.live")
+  .middleware([
+    globals.middleware.task.cache.with({ ttl: 5000 }) // 5 seconds
+  ])
+  .run(async () => fetchLiveStats())
+  .build();
+
+// Rarely changing data: long TTL
+const getStaticContent = r
+  .task("content.static")
+  .middleware([
+    globals.middleware.task.cache.with({ ttl: 3600000 }) // 1 hour
+  ])
+  .run(async (contentId: string) => fetchContent(contentId))
+  .build();
+```
+
+### Disable Auto-Purge
+
+For manual cache management:
+
+```typescript
+const manualCache = r
+  .task("api.manual")
+  .middleware([
+    globals.middleware.task.cache.with({
+      ttl: 60000,
+      ttlAutopurge: false, // Don't auto-remove expired entries
+    })
+  ])
+  .run(async (input) => fetchData(input))
+  .build();
+```
+
+<Warning>
+Disabling auto-purge can lead to memory leaks if you don't manually clear the cache.
+</Warning>
+
+## Execution Journal
+
+The cache middleware records whether the result came from cache:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/cache.middleware";
+
+const trackedTask = r
+  .task("api.tracked")
+  .middleware([globals.middleware.task.cache.with({ ttl: 60000 })])
+  .dependencies({ logger: globals.resources.logger })
+  .run(async (input, { logger }, { journal }) => {
+    const cacheHit = journal.get(journalKeys.hit);
+    
+    if (cacheHit) {
+      await logger.info("Served from cache");
+    } else {
+      await logger.info("Cache miss - executing task");
+    }
+    
+    return fetchData(input);
+  })
+  .build();
+```
+
+### Journal Keys
+
+<ParamField path="journalKeys.hit" type="boolean">
+  Whether the result was served from cache (`true`) or freshly computed (`false`)
+</ParamField>
+
+## Custom Cache Backend
+
+By default, the cache uses an in-memory LRU cache. You can provide a custom cache implementation:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+import { cacheFactoryTask, ICacheInstance } from "@bluelibs/runner/globals/middleware/cache.middleware";
+
+// Custom Redis cache implementation
+class RedisCache implements ICacheInstance {
+  constructor(private client: RedisClient) {}
+  
+  async get(key: string) {
+    const value = await this.client.get(key);
+    return value ? JSON.parse(value) : undefined;
+  }
+  
+  async set(key: string, value: unknown) {
+    await this.client.set(key, JSON.stringify(value));
+  }
+  
+  async clear() {
+    await this.client.flushdb();
+  }
+  
+  async has(key: string) {
+    return (await this.client.exists(key)) === 1;
+  }
+}
+
+// Override the cache factory
+const redisCacheFactory = cacheFactoryTask.override({
+  run: async () => new RedisCache(redisClient)
+});
+
+const app = r
+  .resource("app")
+  .register([
+    redisCacheFactory, // Use Redis instead of LRU
+    // ... your tasks
+  ])
+  .build();
+```
+
+## Combining with Other Middleware
+
+### Cache + Retry
+
+```typescript
+const cachedRetry = r
+  .task("api.cachedRetry")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 }),
+    globals.middleware.task.cache.with({ ttl: 60000 }),
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+```
+
+<Note>
+**Order matters!** Cache runs after retry, so if the first attempt fails but a retry succeeds, the successful result is cached.
+</Note>
+
+### Cache + Timeout
+
+```typescript
+const cachedTimeout = r
+  .task("api.cachedTimeout")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 }),
+    globals.middleware.task.cache.with({ ttl: 60000 }),
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+```
+
+If the result is cached, the timeout doesn't apply—the cached value is returned instantly.
+
+## Common Patterns
+
+### Cache Warming
+
+Pre-populate the cache on startup:
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+
+const getProduct = r
+  .task("products.get")
+  .middleware([globals.middleware.task.cache.with({ ttl: 3600000 })])
+  .run(async (productId: string) => {
+    return database.products.findOne({ id: productId });
+  })
+  .build();
+
+const warmCache = r
+  .hook("app.hooks.warmCache")
+  .on(globals.events.ready)
+  .dependencies({ getProduct })
+  .run(async (event, { getProduct }) => {
+    // Pre-fetch popular products
+    const popularIds = ['prod-1', 'prod-2', 'prod-3'];
+    await Promise.all(popularIds.map(id => getProduct(id)));
+    console.log('Cache warmed');
+  })
+  .build();
+
+const app = r
+  .resource("app")
+  .register([getProduct, warmCache])
+  .build();
+
+const { dispose } = await run(app);
+// Cache is now warm with popular products
+```
+
+### Conditional Caching
+
+Only cache certain responses:
+
+```typescript
+const conditionalCache = r
+  .task("api.conditional")
+  .middleware([globals.middleware.task.cache.with({ ttl: 60000 })])
+  .run(async (input: { userId: string; bustCache?: boolean }) => {
+    const result = await fetchData(input.userId);
+    
+    // Clear cache on demand
+    if (input.bustCache) {
+      // The next request will fetch fresh data
+    }
+    
+    return result;
+  })
+  .build();
+```
+
+### Per-User Caching
+
+Create cache keys that include user context:
+
+```typescript
+const perUserCache = r
+  .task("users.dashboard")
+  .middleware([
+    globals.middleware.task.cache.with({
+      ttl: 300000, // 5 minutes
+      keyBuilder: (taskId, input: { userId: string }) => {
+        return `${taskId}:user:${input.userId}`;
+      }
+    })
+  ])
+  .run(async (input: { userId: string }) => {
+    return generateDashboard(input.userId);
+  })
+  .build();
+```
+
+### Cache with Metrics
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/cache.middleware";
+
+const meteredCache = r
+  .task("api.metered")
+  .dependencies({ logger: globals.resources.logger })
+  .middleware([globals.middleware.task.cache.with({ ttl: 60000 })])
+  .run(async (input, { logger }, { journal }) => {
+    const hit = journal.get(journalKeys.hit);
+    
+    // Track cache hit rate
+    metrics.increment(hit ? 'cache.hit' : 'cache.miss');
+    
+    if (!hit) {
+      await logger.info("Cache miss", { data: { input } });
+    }
+    
+    return expensiveOperation(input);
+  })
+  .build();
+```
+
+## Cache Resource
+
+The cache middleware uses a shared resource for state management:
+
+```typescript
+import { cacheResource } from "@bluelibs/runner/globals/middleware/cache.middleware";
+
+// Configure default cache options
+const app = r
+  .resource("app")
+  .register([
+    cacheResource.with({
+      defaultOptions: {
+        ttl: 60000,  // 1 minute default
+        max: 500,    // 500 items max
+      }
+    })
+  ])
+  .build();
+```
+
+<Note>
+Each task gets its own cache instance, but they share the same factory configuration.
+</Note>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Only cache idempotent operations">
+    Don't cache operations with side effects:
+    ```typescript
+    // Good: read-only operation
+    .middleware([cache.with({ ttl: 60000 })])
+    .run(async (id) => database.users.findOne({ id }))
+    
+    // Bad: has side effects
+    .middleware([cache.with({ ttl: 60000 })]) // DON'T DO THIS
+    .run(async (user) => database.users.insert(user))
+    ```
+  </Accordion>
+
+  <Accordion title="Set appropriate TTLs based on data volatility">
+    ```typescript
+    // Frequently changing: short TTL
+    ttl: 5000,     // 5 seconds
+    
+    // Rarely changing: long TTL
+    ttl: 3600000,  // 1 hour
+    
+    // Static content: very long TTL
+    ttl: 86400000, // 24 hours
+    ```
+  </Accordion>
+
+  <Accordion title="Use custom keyBuilder for complex inputs">
+    Default serialization might not capture all relevant fields:
+    ```typescript
+    keyBuilder: (taskId, input: SearchInput) => {
+      // Include only fields that affect the result
+      return `${taskId}:${input.query}:${input.page}`;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Monitor cache hit rates">
+    Low hit rates mean you're wasting memory:
+    ```typescript
+    const hit = journal.get(journalKeys.hit);
+    metrics.gauge('cache.hit_rate', hit ? 1 : 0);
+    ```
+  </Accordion>
+
+  <Accordion title="Set max to prevent unbounded growth">
+    Always set a maximum cache size:
+    ```typescript
+    .middleware([
+      globals.middleware.task.cache.with({
+        ttl: 60000,
+        max: 1000, // Prevent memory leaks
+      })
+    ])
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Cache Invalidation Strategies
+
+### Time-based (TTL)
+
+The default strategy—entries expire after a fixed time:
+
+```typescript
+.middleware([globals.middleware.task.cache.with({ ttl: 60000 })])
+```
+
+### Manual Invalidation
+
+For event-driven invalidation, you'll need a custom cache implementation that exposes a `delete` method.
+
+### Cache-aside Pattern
+
+Fetch from cache, update on write:
+
+```typescript
+const getUser = r
+  .task("users.get")
+  .middleware([globals.middleware.task.cache.with({ ttl: Infinity })])
+  .run(async (userId: string) => database.users.findOne({ id: userId }))
+  .build();
+
+const updateUser = r
+  .task("users.update")
+  .run(async (user: User) => {
+    const updated = await database.users.update(user);
+    // Cache is NOT automatically cleared - requires custom implementation
+    return updated;
+  })
+  .build();
+```
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="Retry Middleware" icon="rotate-right" href="/middleware/retry">
+    Combine caching with retry logic
+  </Card>
+  <Card title="Rate Limit" icon="gauge-high" href="/middleware/rate-limit">
+    Control request frequency
+  </Card>
+  <Card title="Custom Middleware" icon="code" href="/middleware/custom">
+    Build custom caching strategies
+  </Card>
+</CardGroup>

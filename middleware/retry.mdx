@@ -1,0 +1,404 @@
+---
+title: Retry Middleware
+description: Automatically retry failed operations with exponential backoff and configurable strategies
+---
+
+The retry middleware automatically retries failed operations, making your application resilient to transient failures like network timeouts, temporary service unavailability, or race conditions.
+
+## When to Use Retry
+
+<CardGroup cols={2}>
+  <Card title="External API calls" icon="cloud">
+    Network requests that may fail temporarily
+  </Card>
+  <Card title="Database operations" icon="database">
+    Transactions that might deadlock or timeout
+  </Card>
+  <Card title="File operations" icon="file">
+    I/O operations that can fail intermittently
+  </Card>
+  <Card title="Distributed systems" icon="network-wired">
+    Any operation in a distributed environment
+  </Card>
+</CardGroup>
+
+## Quick Start
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const callAPI = r
+  .task("api.fetchData")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 })
+  ])
+  .run(async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  })
+  .build();
+```
+
+This task will retry up to 3 times with exponential backoff if the fetch fails.
+
+## Configuration
+
+<ParamField path="retries" type="number" default="3">
+  Maximum number of retry attempts after the initial try.
+  
+  **Example:** `retries: 3` means 4 total attempts (1 initial + 3 retries)
+</ParamField>
+
+<ParamField path="delayStrategy" type="(attempt: number, error: Error) => number" default="Exponential backoff">
+  Custom function to calculate delay between retries in milliseconds.
+  
+  **Default behavior:** `100 * Math.pow(2, attempt)` with jitter
+  - Attempt 0: 100-150ms
+  - Attempt 1: 200-300ms  
+  - Attempt 2: 400-600ms
+  - Attempt 3: 800-1200ms
+</ParamField>
+
+<ParamField path="stopRetryIf" type="(error: Error) => boolean" default="() => false">
+  Callback to determine if retries should stop based on the error.
+  
+  Return `true` to stop retrying, `false` to continue.
+</ParamField>
+
+## Examples
+
+### Basic Retry with Custom Attempts
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const fetchUser = r
+  .task("users.fetch")
+  .middleware([
+    globals.middleware.task.retry.with({ 
+      retries: 5 // Retry up to 5 times
+    })
+  ])
+  .run(async (userId: string) => {
+    return database.users.findOne({ id: userId });
+  })
+  .build();
+```
+
+### Custom Delay Strategy
+
+Implement linear backoff instead of exponential:
+
+```typescript
+const customRetry = r
+  .task("api.custom")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      delayStrategy: (attempt) => {
+        // Linear backoff: 1s, 2s, 3s
+        return (attempt + 1) * 1000;
+      }
+    })
+  ])
+  .run(async (input) => callExternalService(input))
+  .build();
+```
+
+### Fixed Delay
+
+Use the same delay between all retries:
+
+```typescript
+const fixedDelay = r
+  .task("api.fixed")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      delayStrategy: () => 2000 // Always wait 2 seconds
+    })
+  ])
+  .run(async (input) => processData(input))
+  .build();
+```
+
+### Immediate Retry (No Delay)
+
+```typescript
+const immediateRetry = r
+  .task("api.immediate")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      delayStrategy: () => 0 // No delay between retries
+    })
+  ])
+  .run(async (input) => quickOperation(input))
+  .build();
+```
+
+### Conditional Retry
+
+Only retry specific error types:
+
+```typescript
+const conditionalRetry = r
+  .task("api.conditional")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      stopRetryIf: (error) => {
+        // Don't retry client errors (4xx)
+        if (error.message.includes('404')) return true;
+        if (error.message.includes('400')) return true;
+        
+        // Retry server errors (5xx) and network errors
+        return false;
+      }
+    })
+  ])
+  .run(async (url: string) => {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json();
+  })
+  .build();
+```
+
+### Error-Aware Delay
+
+Adjust delay based on error type:
+
+```typescript
+const errorAwareRetry = r
+  .task("api.errorAware")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      delayStrategy: (attempt, error) => {
+        // Longer delay for rate limit errors
+        if (error.message.includes('rate limit')) {
+          return 60000; // Wait 1 minute
+        }
+        // Normal exponential backoff for other errors
+        return 100 * Math.pow(2, attempt);
+      }
+    })
+  ])
+  .run(async (input) => apiCall(input))
+  .build();
+```
+
+## Combining with Other Middleware
+
+### Retry + Timeout
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const robustTask = r
+  .task("api.robust")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 }),
+    globals.middleware.task.timeout.with({ ttl: 10000 }), // 10s per attempt
+  ])
+  .run(async (input) => unreliableOperation(input))
+  .build();
+```
+
+<Note>
+Each retry attempt gets its own 10-second timeout. The total maximum time is 3 retries × 10 seconds = 30 seconds (plus retry delays).
+</Note>
+
+### Retry + Circuit Breaker
+
+```typescript
+const protectedTask = r
+  .task("api.protected")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 2 }),
+    globals.middleware.task.circuitBreaker.with({ 
+      failureThreshold: 5,
+      resetTimeout: 30000 
+    }),
+  ])
+  .run(async (input) => callDownstreamService(input))
+  .build();
+```
+
+## Execution Journal
+
+The retry middleware exposes state via the execution journal:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/retry.middleware";
+
+const monitoredTask = r
+  .task("api.monitored")
+  .middleware([globals.middleware.task.retry.with({ retries: 3 })])
+  .run(async (input, deps, { journal }) => {
+    // Check current attempt number
+    const attempt = journal.get(journalKeys.attempt); // 0, 1, 2, 3...
+    
+    // Get the last error that triggered a retry
+    const lastError = journal.get(journalKeys.lastError);
+    
+    console.log(`Attempt ${attempt}`);
+    if (lastError) {
+      console.log(`Previous error: ${lastError.message}`);
+    }
+    
+    return processData(input);
+  })
+  .build();
+```
+
+### Journal Keys
+
+<ParamField path="journalKeys.attempt" type="number">
+  Current retry attempt number (0 = first attempt, 1 = first retry, etc.)
+</ParamField>
+
+<ParamField path="journalKeys.lastError" type="Error">
+  The error that caused the most recent retry
+</ParamField>
+
+## Interaction with Timeout Middleware
+
+Retry middleware is aware of timeout middleware and won't retry operations that were aborted due to timeout:
+
+```typescript
+const timeoutAwareRetry = r
+  .task("api.timeoutAware")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 }),
+    globals.middleware.task.timeout.with({ ttl: 5000 }),
+  ])
+  .run(async (input) => slowOperation(input))
+  .build();
+```
+
+If the timeout triggers, the retry middleware **will not** retry—it will immediately throw the timeout error.
+
+## Common Patterns
+
+### Database Deadlock Retry
+
+```typescript
+const saveUser = r
+  .task("users.save")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 5,
+      delayStrategy: (attempt) => 50 * Math.pow(2, attempt),
+      stopRetryIf: (error) => {
+        // Only retry deadlocks
+        return !error.message.includes('deadlock');
+      }
+    })
+  ])
+  .run(async (userData) => {
+    return database.transaction(async (tx) => {
+      return tx.users.insert(userData);
+    });
+  })
+  .build();
+```
+
+### Retry with Logging
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const loggedRetry = r
+  .task("api.logged")
+  .dependencies({ logger: globals.resources.logger })
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      delayStrategy: (attempt, error) => {
+        const delay = 100 * Math.pow(2, attempt);
+        console.log(`Retry attempt ${attempt + 1} after ${delay}ms due to: ${error.message}`);
+        return delay;
+      }
+    })
+  ])
+  .run(async (input, { logger }) => {
+    await logger.info("Attempting operation");
+    return riskyOperation(input);
+  })
+  .build();
+```
+
+## Best Practices
+
+<Warning>
+**Don't retry everything!** Only retry operations that are:
+- Idempotent (safe to run multiple times)
+- Likely to succeed on retry (transient failures)
+- Not user-facing errors (validation, authentication)
+</Warning>
+
+<AccordionGroup>
+  <Accordion title="Use stopRetryIf for permanent errors">
+    Don't waste time retrying errors that will never succeed:
+    ```typescript
+    stopRetryIf: (error) => {
+      // Don't retry 4xx client errors
+      return error.message.match(/^HTTP [4]\d{2}/);
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Add jitter to prevent thundering herd">
+    The default strategy includes jitter. If you write custom strategies, add randomness:
+    ```typescript
+    delayStrategy: (attempt) => {
+      const base = 100 * Math.pow(2, attempt);
+      const jitter = Math.random() * base * 0.5;
+      return base + jitter;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Combine with timeout for bounded retries">
+    Always use timeout middleware to prevent infinite hangs:
+    ```typescript
+    .middleware([
+      globals.middleware.task.retry.with({ retries: 3 }),
+      globals.middleware.task.timeout.with({ ttl: 10000 }),
+    ])
+    ```
+  </Accordion>
+
+  <Accordion title="Monitor retry rates in production">
+    High retry rates indicate systemic issues:
+    ```typescript
+    .run(async (input, deps, { journal }) => {
+      const attempt = journal.get(journalKeys.attempt);
+      if (attempt > 0) {
+        metrics.increment('task.retry', { attempt });
+      }
+      return operation(input);
+    })
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="Timeout Middleware" icon="clock" href="/middleware/timeout">
+    Prevent operations from hanging
+  </Card>
+  <Card title="Circuit Breaker" icon="circle-exclamation" href="/middleware/circuit-breaker">
+    Fail fast when services are down
+  </Card>
+  <Card title="Fallback Middleware" icon="shield" href="/middleware/custom#fallback-pattern">
+    Provide backup values when retries fail
+  </Card>
+</CardGroup>

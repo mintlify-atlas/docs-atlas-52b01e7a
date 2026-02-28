@@ -1,0 +1,421 @@
+---
+title: Hooks
+description: Lightweight event subscribers with dependency injection
+---
+
+## What Are Hooks?
+
+Hooks are **lightweight event subscribers** in BlueLibs Runner. They listen for events and react when those events are emitted. Unlike tasks, hooks are optimized for side effects and don't return meaningful values.
+
+Think of hooks as "listeners" or "handlers" — when an event happens, hooks spring into action.
+
+## Why Use Hooks?
+
+Hooks solve the problem of **reacting to events** without coupling the emitter to the listener. They let you:
+
+- Send notifications when users register
+- Track analytics when orders complete
+- Update caches when data changes
+- Trigger workflows when critical events occur
+
+<Note>
+**Hooks vs Tasks**: Tasks are for **business logic** that returns a result. Hooks are for **side effects** that react to events. Use tasks when you need a return value, hooks when you're responding to something that already happened.
+</Note>
+
+## Creating Your First Hook
+
+Here's a simple hook that logs when a user registers:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const userRegistered = r
+  .event("app.events.userRegistered")
+  .build();
+
+const logUserRegistration = r
+  .hook("app.hooks.logUserRegistration")
+  .on(userRegistered)
+  .dependencies({ logger: globals.resources.logger })
+  .run(async (event, { logger }) => {
+    await logger.info(`User registered: ${event.data.userId}`);
+  })
+  .build();
+```
+
+<Steps>
+  <Step title="Create the hook">
+    Use `r.hook(id)` with a unique namespaced ID like `"app.hooks.logUserRegistration"`.
+  </Step>
+  <Step title="Specify which event to listen to">
+    Call `.on(event)` to specify which event triggers this hook.
+  </Step>
+  <Step title="Add dependencies">
+    Use `.dependencies({ ... })` to inject services the hook needs.
+  </Step>
+  <Step title="Define the handler">
+    Call `.run(async (event, deps) => { ... })` to define what happens when the event fires.
+  </Step>
+  <Step title="Build and register">
+    Build the hook and register it in your app resource.
+  </Step>
+</Steps>
+
+## Hooks with Dependencies
+
+Hooks can depend on resources, tasks, or other services:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const mailer = r
+  .resource("app.mailer")
+  .init(async () => ({
+    send: async (to: string, subject: string, body: string) => {
+      console.log(`Email to ${to}: ${subject}`);
+    },
+  }))
+  .build();
+
+const sendWelcomeEmail = r
+  .hook("app.hooks.sendWelcomeEmail")
+  .on(userRegistered)
+  .dependencies({ mailer })
+  .run(async (event, { mailer }) => {
+    await mailer.send(
+      event.data.email,
+      "Welcome!",
+      "Thanks for joining our platform!"
+    );
+  })
+  .build();
+```
+
+<Tip>
+Dependencies are **automatically injected** as the second parameter to `.run()`. TypeScript infers the types, so you get full autocomplete.
+</Tip>
+
+## Listening to Multiple Events
+
+Use `onAnyOf()` to listen to several events with a single hook:
+
+```typescript
+import { r } from "@bluelibs/runner";
+import { onAnyOf } from "@bluelibs/runner/defs";
+
+const userRegistered = r.event("app.events.userRegistered").build();
+const userLoggedIn = r.event("app.events.userLoggedIn").build();
+
+const trackUserActivity = r
+  .hook("app.hooks.trackUserActivity")
+  .on(onAnyOf(userRegistered, userLoggedIn))
+  .dependencies({ analytics })
+  .run(async (event, { analytics }) => {
+    await analytics.track(event.definition.id, event.data);
+  })
+  .build();
+```
+
+<Note>
+`onAnyOf()` preserves type inference. The `event` parameter will be typed as a union of all event payloads.
+</Note>
+
+## Hook Execution Order
+
+Hooks execute in **order of registration** by default. Control the order explicitly with `.order()`:
+
+```typescript
+const criticalHook = r
+  .hook("app.hooks.critical")
+  .on(userRegistered)
+  .order(1) // Runs first
+  .run(async (event) => {
+    console.log("Critical: Save to database");
+  })
+  .build();
+
+const normalHook = r
+  .hook("app.hooks.normal")
+  .on(userRegistered)
+  .order(10) // Runs later
+  .run(async (event) => {
+    console.log("Normal: Send notification");
+  })
+  .build();
+
+const lowPriorityHook = r
+  .hook("app.hooks.lowPriority")
+  .on(userRegistered)
+  .order(100) // Runs last
+  .run(async (event) => {
+    console.log("Low priority: Update analytics");
+  })
+  .build();
+```
+
+<Tip>
+**Lower numbers run first**. Use this to ensure critical operations complete before optional ones.
+</Tip>
+
+## Stopping Propagation
+
+A hook can **stop propagation** to prevent downstream hooks from running:
+
+```typescript
+const validateUserHook = r
+  .hook("app.hooks.validateUser")
+  .on(userRegistered)
+  .order(1)
+  .run(async (event) => {
+    if (!isValidEmail(event.data.email)) {
+      event.stopPropagation(); // Stop other hooks
+      throw new Error("Invalid email address");
+    }
+  })
+  .build();
+
+const sendWelcomeEmail = r
+  .hook("app.hooks.sendWelcomeEmail")
+  .on(userRegistered)
+  .order(10)
+  .run(async (event, { mailer }) => {
+    // This won't run if validation fails
+    await mailer.send(event.data.email, "Welcome!", "Thanks for joining!");
+  })
+  .build();
+```
+
+<Note>
+**When to stop propagation**: Use it for validation hooks or circuit breakers. Once you call `stopPropagation()`, no hooks with higher order numbers will run.
+</Note>
+
+## Wildcard Hooks: Listen to Everything
+
+Create a **wildcard hook** to listen to **all events** in your application:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const auditAllEvents = r
+  .hook("app.hooks.auditAllEvents")
+  .on("*") // Wildcard: listen to all events
+  .dependencies({ logger: globals.resources.logger })
+  .run(async (event, { logger }) => {
+    await logger.info(`Event: ${event.definition.id}`, {
+      data: event.data,
+      timestamp: new Date(),
+    });
+  })
+  .build();
+```
+
+Use wildcard hooks for:
+- **Audit logs**: Track all events in the system
+- **Debugging**: Log every event during development
+- **Monitoring**: Send all events to an observability platform
+
+<Tip>
+**Exclude events from wildcard hooks**: Tag events with `globals.tags.excludeFromGlobalHooks` to prevent them from triggering wildcard hooks.
+</Tip>
+
+## Parallel Execution
+
+By default, hooks run **sequentially**. Enable **parallel execution** on the event:
+
+```typescript
+const userRegistered = r
+  .event("app.events.userRegistered")
+  .parallel(true) // Enable parallel execution
+  .build();
+
+const sendWelcomeEmail = r
+  .hook("app.hooks.sendWelcomeEmail")
+  .on(userRegistered)
+  .order(10)
+  .run(async (event, { mailer }) => {
+    await mailer.send(event.data.email, "Welcome!", "...");
+  })
+  .build();
+
+const trackAnalytics = r
+  .hook("app.hooks.trackAnalytics")
+  .on(userRegistered)
+  .order(10) // Same order as sendWelcomeEmail
+  .run(async (event, { analytics }) => {
+    await analytics.track("user.registered", event.data);
+  })
+  .build();
+```
+
+With `.parallel(true)`:
+- Hooks with the **same order** run **concurrently**
+- Different order groups run **sequentially**
+- If one hook fails, all hooks in the batch complete, then an `AggregateError` is thrown
+
+<Note>
+**When to use parallel execution**: Use it for independent side effects like notifications and analytics. Avoid it for operations that depend on each other or share mutable state.
+</Note>
+
+## Error Handling
+
+Hooks can fail, and you control how those failures are handled:
+
+<CodeGroup>
+
+```typescript Fail Fast (Default)
+// Throws immediately when a hook fails
+await userRegistered({ userId: "123", email: "user@example.com" });
+```
+
+```typescript Aggregate Errors
+// Runs all hooks, then throws AggregateError with all failures
+await userRegistered(
+  { userId: "123", email: "user@example.com" },
+  { failureMode: "aggregate" }
+);
+```
+
+```typescript Get Report
+// Returns a report instead of throwing
+const report = await userRegistered(
+  { userId: "123", email: "user@example.com" },
+  { report: true, throwOnError: false }
+);
+console.log(report.failedListeners);
+```
+
+</CodeGroup>
+
+<Tip>
+Use **aggregate mode** when you want all side effects to attempt execution, even if some fail. Use **fail-fast** when any failure should halt processing.
+</Tip>
+
+## Real-World Example: User Registration Hooks
+
+Here's a complete example showing multiple hooks reacting to a single event:
+
+```typescript src/users/events.ts
+import { r } from "@bluelibs/runner";
+import { z } from "zod";
+
+export const userRegistered = r
+  .event("app.events.userRegistered")
+  .payloadSchema(
+    z.object({
+      userId: z.string(),
+      email: z.string().email(),
+      name: z.string(),
+    })
+  )
+  .build();
+```
+
+```typescript src/notifications/hooks/welcome-email.hook.ts
+import { r } from "@bluelibs/runner";
+import { userRegistered } from "../../users/events";
+import { mailer } from "../resources/mailer.resource";
+
+export const sendWelcomeEmail = r
+  .hook("app.hooks.sendWelcomeEmail")
+  .meta({
+    title: "Send Welcome Email",
+    description: "Sends a welcome email to newly registered users",
+  })
+  .on(userRegistered)
+  .order(10)
+  .dependencies({ mailer })
+  .run(async (event, { mailer }) => {
+    await mailer.send({
+      to: event.data.email,
+      subject: "Welcome to Our Platform!",
+      body: `Hi ${event.data.name}, thanks for joining us!`,
+    });
+  })
+  .build();
+```
+
+```typescript src/analytics/hooks/track-registration.hook.ts
+import { r } from "@bluelibs/runner";
+import { userRegistered } from "../../users/events";
+import { analytics } from "../resources/analytics.resource";
+
+export const trackRegistration = r
+  .hook("app.hooks.trackRegistration")
+  .meta({
+    title: "Track User Registration",
+    description: "Sends registration event to analytics platform",
+  })
+  .on(userRegistered)
+  .order(20)
+  .dependencies({ analytics })
+  .run(async (event, { analytics }) => {
+    await analytics.track("user.registered", {
+      userId: event.data.userId,
+      timestamp: new Date(),
+    });
+  })
+  .build();
+```
+
+```typescript src/slack/hooks/notify-team.hook.ts
+import { r } from "@bluelibs/runner";
+import { userRegistered } from "../../users/events";
+import { slack } from "../resources/slack.resource";
+
+export const notifyTeam = r
+  .hook("app.hooks.notifyTeam")
+  .meta({
+    title: "Notify Team on Slack",
+    description: "Posts a Slack message when a new user registers",
+  })
+  .on(userRegistered)
+  .order(30)
+  .dependencies({ slack })
+  .run(async (event, { slack }) => {
+    await slack.post({
+      channel: "#new-users",
+      text: `New user registered: ${event.data.name} (${event.data.email})`,
+    });
+  })
+  .build();
+```
+
+<Note>
+All three hooks run **independently**. If the Slack hook fails, the email and analytics hooks still run (assuming you use `failureMode: "aggregate"`).
+</Note>
+
+## Hooks vs Tasks: When to Use What?
+
+| Use Hooks When... | Use Tasks When... |
+|-------------------|-------------------|
+| Reacting to an event | Performing business logic |
+| Side effects (emails, logs, analytics) | Returning a result |
+| Multiple independent actions | Single focused action |
+| Order matters but results don't | You need the return value |
+| Fire-and-forget behavior | Awaiting the outcome |
+
+## Best Practices
+
+<Steps>
+  <Step title="Use descriptive IDs">
+    Follow the pattern `domain.hooks.actionName` (e.g., `"notifications.hooks.sendWelcomeEmail"`).
+  </Step>
+  <Step title="Add metadata">
+    Always set `.meta({ title, description })` for documentation.
+  </Step>
+  <Step title="Keep hooks focused">
+    One hook should do one thing. Create multiple hooks instead of one complex hook.
+  </Step>
+  <Step title="Use order wisely">
+    Only set explicit order when it matters. Otherwise, rely on registration order.
+  </Step>
+  <Step title="Handle errors gracefully">
+    Hooks should not crash the entire app. Use try-catch for non-critical operations.
+  </Step>
+</Steps>
+
+## Related Concepts
+
+- [Events](/concepts/events) - Hooks listen to events
+- [Tasks](/concepts/tasks) - Tasks can emit events that trigger hooks
+- [Lifecycle](/concepts/lifecycle) - Built-in lifecycle events like `ready` and `shutdown`

@@ -1,80 +1,193 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick start
+description: Get your first Runner app working in 5 minutes
 ---
 
-## Get started in three steps
+<Note>
+  New to Runner? This guide gets you to a working example as quickly as possible.
+</Note>
 
-Get your documentation site running locally and make your first customization.
+## What you'll build
 
-### Step 1: Set up your local environment
+You'll create a simple task that greets users, demonstrating:
+- Task definition with dependencies
+- Resource lifecycle (init/dispose)
+- Middleware (automatic retries)
+- Input validation with Zod
+- Running your app
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+## Installation
 
-### Step 2: Deploy your changes
+<Steps>
+  <Step title="Install dependencies">
+    Install Runner and Zod for schema validation:
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    <CodeGroup>
+      ```bash npm
+      npm install @bluelibs/runner zod
+      npm install -D typescript tsx
+      ```
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+      ```bash yarn
+      yarn add @bluelibs/runner zod
+      yarn add -D typescript tsx
+      ```
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+      ```bash pnpm
+      pnpm add @bluelibs/runner zod
+      pnpm add -D typescript tsx
+      ```
+    </CodeGroup>
 
-### Step 3: Go live
+    <Note>
+      This guide assumes Node.js 18+ and TypeScript 5.6+. See [Installation](/installation) for detailed requirements.
+    </Note>
+  </Step>
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+  <Step title="Create your first task">
+    Create a file called `index.ts` and add the following code:
+
+    ```typescript index.ts
+    import { r, run, globals } from "@bluelibs/runner";
+    import { z } from "zod";
+
+    // Resources are singletons with lifecycle management and async construction
+    const db = r
+      .resource("app.db")
+      .init(async () => {
+        const conn = await postgres.connect(process.env.DB_URL);
+        return conn;
+      })
+      .build();
+
+    const mailer = r
+      .resource("app.mailer")
+      .init(async () => ({
+        sendWelcome: async (email: string) => {
+          console.log(`Sending welcome email to ${email}`);
+        },
+      }))
+      .build();
+
+    // Define a task with dependencies, middleware, and zod validation
+    const createUser = r
+      .task("users.create")
+      .dependencies({ db, mailer })
+      .middleware([globals.middleware.task.retry.with({ retries: 3 })])
+      .inputSchema(z.object({ name: z.string(), email: z.string().email() }))
+      .run(async (input, { db, mailer }) => {
+        const user = await db.users.insert(input);
+        await mailer.sendWelcome(user.email);
+        return user;
+      })
+      .build();
+
+    // Compose resources and run your application
+    const app = r
+      .resource("app") // top-level app resource
+      .register([db, mailer, createUser]) // register all elements
+      .build();
+
+    const runtime = await run(app);
+    await runtime.runTask(createUser, { name: "Ada", email: "ada@example.com" });
+    // await runtime.dispose() when you are done.
+    ```
+  </Step>
+
+  <Step title="Run your app">
+    Execute your TypeScript file:
+
+    ```bash
+    npx tsx index.ts
+    ```
+
+    You should see output like:
+
+    ```
+    Sending welcome email to ada@example.com
+    ```
+
+    That's it! You now have a working Runner application.
+  </Step>
+</Steps>
+
+## What just happened?
+
+Let's break down what you built:
+
+### Resources (singletons with lifecycle)
+
+```typescript
+const db = r
+  .resource("app.db")
+  .init(async () => {
+    const conn = await postgres.connect(process.env.DB_URL);
+    return conn;
+  })
+  .build();
+```
+
+Resources are singletons with `init` and `dispose` lifecycle methods. They're perfect for databases, HTTP servers, or anything that needs setup and teardown.
+
+### Tasks (business logic with DI)
+
+```typescript
+const createUser = r
+  .task("users.create")
+  .dependencies({ db, mailer })
+  .middleware([globals.middleware.task.retry.with({ retries: 3 })])
+  .inputSchema(z.object({ name: z.string(), email: z.string().email() }))
+  .run(async (input, { db, mailer }) => {
+    const user = await db.users.insert(input);
+    await mailer.sendWelcome(user.email);
+    return user;
+  })
+  .build();
+```
+
+Tasks are async functions with:
+- **Explicit dependencies**: `dependencies({ db, mailer })` injects what the task needs
+- **Middleware**: Add cross-cutting concerns like retries, timeouts, or caching
+- **Validation**: Input and output schemas ensure type safety at runtime
+- **Type safety**: Full TypeScript inference throughout
+
+### App composition
+
+```typescript
+const app = r
+  .resource("app")
+  .register([db, mailer, createUser])
+  .build();
+```
+
+The root resource composes everything together. Runner wires all dependencies automatically.
+
+### Runtime
+
+```typescript
+const runtime = await run(app);
+await runtime.runTask(createUser, { name: "Ada", email: "ada@example.com" });
+```
+
+The `run()` function initializes all resources, wires dependencies, and returns a runtime object with methods like `runTask`, `emitEvent`, and `dispose`.
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Tasks" icon="code" href="/tasks">
+    Learn more about defining and composing tasks
+  </Card>
+  <Card title="Resources" icon="database" href="/resources">
+    Understand resource lifecycle and patterns
+  </Card>
+  <Card title="Middleware" icon="shield" href="/middleware">
+    Add reliability with built-in middleware
+  </Card>
+  <Card title="Testing" icon="flask" href="/testing">
+    Write tests for your Runner apps
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+<Tip>
+  Want to see real-world examples? Check out the [Express + OpenAPI + SQLite](https://github.com/bluelibs/runner/tree/main/examples/express-openapi-sqlite) and [Fastify + MikroORM + PostgreSQL](https://github.com/bluelibs/runner/tree/main/examples/fastify-mikroorm) examples in the GitHub repository.
+</Tip>

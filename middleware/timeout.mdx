@@ -1,0 +1,439 @@
+---
+title: Timeout Middleware
+description: Prevent operations from hanging indefinitely with configurable time limits
+---
+
+The timeout middleware ensures that operations complete within a specified time limit. If an operation takes too long, it's automatically aborted and a `TimeoutError` is thrown.
+
+## When to Use Timeout
+
+<CardGroup cols={2}>
+  <Card title="External API calls" icon="cloud">
+    Prevent hanging on slow or unresponsive services
+  </Card>
+  <Card title="Database queries" icon="database">
+    Abort slow queries that might lock resources
+  </Card>
+  <Card title="User-facing operations" icon="user">
+    Ensure responsive UX by failing fast
+  </Card>
+  <Card title="Resource-intensive tasks" icon="microchip">
+    Limit CPU/memory usage by bounding execution time
+  </Card>
+</CardGroup>
+
+## Quick Start
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const fetchData = r
+  .task("api.fetchData")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 }) // 5 second timeout
+  ])
+  .run(async (url: string) => {
+    const response = await fetch(url);
+    return response.json();
+  })
+  .build();
+```
+
+If the fetch takes longer than 5 seconds, a `TimeoutError` is thrown.
+
+## Configuration
+
+<ParamField path="ttl" type="number" required>
+  Maximum time in milliseconds before the operation is aborted.
+  
+  **Special values:**
+  - `0`: Immediate timeout (useful for testing)
+  - `> 0`: Normal timeout behavior
+</ParamField>
+
+## Examples
+
+### Basic Timeout
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const slowQuery = r
+  .task("db.slowQuery")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 10000 }) // 10 seconds
+  ])
+  .run(async (query: string) => {
+    return database.execute(query);
+  })
+  .build();
+```
+
+### Different Timeouts for Different Operations
+
+```typescript
+// Fast timeout for user-facing operations
+const getUserProfile = r
+  .task("users.getProfile")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 2000 }) // 2 seconds
+  ])
+  .run(async (userId: string) => {
+    return database.users.findOne({ id: userId });
+  })
+  .build();
+
+// Longer timeout for background jobs
+const generateReport = r
+  .task("reports.generate")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 60000 }) // 1 minute
+  ])
+  .run(async (reportId: string) => {
+    return reportGenerator.create(reportId);
+  })
+  .build();
+```
+
+### Handling Timeout Errors
+
+```typescript
+import { r, globals, run } from "@bluelibs/runner";
+import { TimeoutError } from "@bluelibs/runner/globals/middleware/timeout.middleware";
+
+const apiCall = r
+  .task("api.call")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 })
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+
+const app = r.resource("app").register([apiCall]).build();
+const { runTask, dispose } = await run(app);
+
+try {
+  const result = await runTask(apiCall, "https://slow-api.example.com");
+  console.log(result);
+} catch (error) {
+  if (error instanceof TimeoutError) {
+    console.error("Operation timed out:", error.message);
+    // "Operation timed out after 5000ms"
+  } else {
+    console.error("Other error:", error);
+  }
+}
+
+await dispose();
+```
+
+## Combining with Other Middleware
+
+### Timeout + Retry
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const robustAPI = r
+  .task("api.robust")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 }),
+    globals.middleware.task.timeout.with({ ttl: 10000 }), // Each attempt gets 10s
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+```
+
+<Note>
+**Important:** Each retry attempt gets its own timeout. If you have 3 retries and a 10-second timeout, the maximum total time is approximately 30 seconds (plus retry delays).
+
+The retry middleware is smart—it won't retry if the operation was aborted by timeout.
+</Note>
+
+### Timeout + Circuit Breaker
+
+```typescript
+const protectedAPI = r
+  .task("api.protected")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 }),
+    globals.middleware.task.circuitBreaker.with({
+      failureThreshold: 5,
+      resetTimeout: 30000
+    }),
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+```
+
+Timeout errors count as failures for the circuit breaker. Multiple timeouts will trip the circuit.
+
+### Timeout + Cache
+
+```typescript
+const cachedAPI = r
+  .task("api.cached")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 }),
+    globals.middleware.task.cache.with({ ttl: 60000 }), // Cache for 1 minute
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+```
+
+<Note>
+If the result is already cached, the timeout doesn't apply—the cached value is returned immediately.
+</Note>
+
+## Execution Journal
+
+The timeout middleware exposes an `AbortController` via the execution journal:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/timeout.middleware";
+
+const fetchWithProgress = r
+  .task("api.withProgress")
+  .middleware([globals.middleware.task.timeout.with({ ttl: 10000 })])
+  .run(async (url: string, deps, { journal }) => {
+    // Access the AbortController created by timeout middleware
+    const controller = journal.get(journalKeys.abortController);
+    
+    // Use it with fetch for proper cancellation
+    const response = await fetch(url, { signal: controller?.signal });
+    return response.json();
+  })
+  .build();
+```
+
+### Journal Keys
+
+<ParamField path="journalKeys.abortController" type="AbortController">
+  The `AbortController` created by the timeout middleware. Use its `signal` property to make operations cancellable.
+</ParamField>
+
+## Proper Cancellation with AbortSignal
+
+For operations that support `AbortSignal`, pass the signal to enable immediate cancellation:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/timeout.middleware";
+
+const cancellableFetch = r
+  .task("api.cancellable")
+  .middleware([globals.middleware.task.timeout.with({ ttl: 5000 })])
+  .run(async (url: string, deps, { journal }) => {
+    const signal = journal.get(journalKeys.abortController)?.signal;
+    
+    // Pass signal to fetch for immediate cancellation
+    const response = await fetch(url, { signal });
+    return response.json();
+  })
+  .build();
+```
+
+<Note>
+When you pass the `AbortSignal` to `fetch` (or other signal-aware APIs), the operation is cancelled immediately when the timeout triggers, freeing resources faster.
+</Note>
+
+## Common Patterns
+
+### Progressive Timeout
+
+Different timeouts for different retry attempts:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys as retryKeys } from "@bluelibs/runner/globals/middleware/retry.middleware";
+
+const progressiveTimeout = r
+  .task("api.progressive")
+  .middleware([
+    globals.middleware.task.retry.with({ retries: 3 }),
+  ])
+  .run(async (url: string, deps, { journal }) => {
+    const attempt = journal.get(retryKeys.attempt) ?? 0;
+    const timeout = 5000 + (attempt * 2000); // 5s, 7s, 9s, 11s
+    
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      return response.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  })
+  .build();
+```
+
+### Conditional Timeout
+
+```typescript
+const conditionalTimeout = r
+  .task("api.conditional")
+  .run(async (input: { url: string; priority: 'high' | 'low' }) => {
+    const timeout = input.priority === 'high' ? 2000 : 10000;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    try {
+      const response = await fetch(input.url, { signal: controller.signal });
+      return response.json();
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  })
+  .build();
+```
+
+### Timeout with Fallback
+
+```typescript
+const withFallback = r
+  .task("api.withFallback")
+  .middleware([
+    globals.middleware.task.timeout.with({ ttl: 5000 }),
+  ])
+  .run(async (url: string) => {
+    try {
+      const response = await fetch(url);
+      return response.json();
+    } catch (error) {
+      if (error instanceof TimeoutError) {
+        // Return cached or default data on timeout
+        return { cached: true, data: await getCachedData(url) };
+      }
+      throw error;
+    }
+  })
+  .build();
+```
+
+## Resource Timeout
+
+You can also apply timeout to resource initialization:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const database = r
+  .resource("app.db")
+  .middleware([
+    globals.middleware.resource.timeout.with({ ttl: 10000 }) // 10s to connect
+  ])
+  .init(async () => {
+    const client = new MongoClient(process.env.DATABASE_URL);
+    await client.connect();
+    return client;
+  })
+  .dispose(async (client) => client.close())
+  .build();
+```
+
+<Warning>
+If resource initialization times out, the entire `run()` call will fail. Set generous timeouts for critical resources.
+</Warning>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Set realistic timeouts">
+    Choose timeouts based on actual operation performance:
+    ```typescript
+    // Too short - will timeout even on normal operations
+    .middleware([globals.middleware.task.timeout.with({ ttl: 100 })])
+    
+    // Better - based on p95 latency + buffer
+    .middleware([globals.middleware.task.timeout.with({ ttl: 5000 })])
+    ```
+  </Accordion>
+
+  <Accordion title="Use AbortSignal for clean cancellation">
+    Always pass the abort signal to operations that support it:
+    ```typescript
+    const signal = journal.get(journalKeys.abortController)?.signal;
+    await fetch(url, { signal });
+    ```
+  </Accordion>
+
+  <Accordion title="Combine with retry for resilience">
+    Timeout alone fails fast. Retry gives operations another chance:
+    ```typescript
+    .middleware([
+      globals.middleware.task.retry.with({ retries: 2 }),
+      globals.middleware.task.timeout.with({ ttl: 10000 }),
+    ])
+    ```
+  </Accordion>
+
+  <Accordion title="Monitor timeout rates">
+    High timeout rates indicate systemic issues:
+    ```typescript
+    try {
+      return await operation();
+    } catch (error) {
+      if (error instanceof TimeoutError) {
+        metrics.increment('task.timeout');
+        logger.warn('Operation timed out', { task: 'api.call' });
+      }
+      throw error;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Different timeouts for different environments">
+    Use environment variables for configurable timeouts:
+    ```typescript
+    const timeout = parseInt(process.env.API_TIMEOUT || '5000', 10);
+    
+    .middleware([
+      globals.middleware.task.timeout.with({ ttl: timeout })
+    ])
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Timeout Error Details
+
+The `TimeoutError` class extends `RunnerError` and includes:
+
+```typescript
+import { TimeoutError } from "@bluelibs/runner/globals/middleware/timeout.middleware";
+
+try {
+  await runTask(myTask, input);
+} catch (error) {
+  if (error instanceof TimeoutError) {
+    console.log(error.message);  // "Operation timed out after 5000ms"
+    console.log(error.id);       // "runner.errors.middlewareTimeout"
+    console.log(error.httpCode); // 408 (Request Timeout)
+    console.log(error.data);     // { message: "Operation timed out after 5000ms" }
+  }
+}
+```
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="Retry Middleware" icon="rotate-right" href="/middleware/retry">
+    Automatically retry failed operations
+  </Card>
+  <Card title="Circuit Breaker" icon="circle-exclamation" href="/middleware/circuit-breaker">
+    Fail fast when services are unavailable
+  </Card>
+  <Card title="Custom Middleware" icon="code" href="/middleware/custom">
+    Build your own timeout strategies
+  </Card>
+</CardGroup>

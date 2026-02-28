@@ -1,0 +1,348 @@
+---
+title: Test Resources
+description: Using createTestResource helper and test runtime utilities for integration testing
+---
+
+Runner provides `createTestResource()` as a convenience helper for integration tests. However, **it's deprecated** in favor of calling `run()` directly, which provides better flexibility and type safety.
+
+<Warning>
+`createTestResource()` is deprecated. Use `run()` directly in your tests instead, which provides the same benefits with a more flexible API and better type safety.
+</Warning>
+
+## The Modern Approach: run() Directly
+
+Instead of using `createTestResource`, call `run()` directly with your app or test app:
+
+```typescript
+import { r, run, override } from "@bluelibs/runner";
+
+// Your production app
+const database = r.resource("app.db")
+  .init(async () => connectToPostgres())
+  .build();
+
+const myTask = r.task("app.task")
+  .dependencies({ database })
+  .run(async (input, { database }) => {
+    return database.query(input);
+  })
+  .build();
+
+const app = r.resource("app")
+  .register([database, myTask])
+  .build();
+
+// In tests - create a test-specific app with overrides
+const testDb = override(database, {
+  init: async () => new InMemoryDatabase()
+});
+
+const testApp = r.resource("test.app")
+  .register([database, myTask])
+  .overrides([testDb])
+  .build();
+
+const { runTask, dispose } = await run(testApp);
+
+try {
+  const result = await runTask(myTask, "SELECT * FROM users");
+  expect(result).toBeDefined();
+} finally {
+  await dispose();
+}
+```
+
+## Test Runtime Utilities
+
+When you call `run(app)`, you get back a runtime object with useful testing utilities:
+
+```typescript
+const {
+  runTask,           // Execute tasks
+  emitEvent,         // Emit events
+  getResourceValue,  // Access resource values
+  dispose,           // Clean up
+  store,             // Access internal store
+  taskRunner,        // Access TaskRunner
+  logger,            // Access Logger
+  eventManager,      // Access EventManager
+} = await run(app);
+```
+
+### runTask
+
+Execute tasks through the full pipeline (middleware, validation, etc.):
+
+```typescript
+const result = await runTask(myTask, input);
+
+// Type-safe when task has input schema
+const user = await runTask(createUser, {
+  name: "Ada",
+  email: "ada@example.com"
+});
+```
+
+### getResourceValue
+
+Access initialized resource values in tests:
+
+```typescript
+const { runTask, getResourceValue, dispose } = await run(app);
+
+try {
+  const db = await getResourceValue(database);
+  expect(db).toBeDefined();
+  expect(db.connected).toBe(true);
+  
+  // Use in assertions
+  await runTask(createUser, { name: "Bob", email: "bob@test.com" });
+  const users = await db.query("SELECT * FROM users");
+  expect(users).toHaveLength(1);
+} finally {
+  await dispose();
+}
+```
+
+### emitEvent
+
+Trigger events and test hook reactions:
+
+```typescript
+const userCreated = r.event("app.events.userCreated")
+  .payloadSchema(z.object({ userId: z.string() }))
+  .build();
+
+const sendEmail = r.hook("app.hooks.sendEmail")
+  .on(userCreated)
+  .dependencies({ emailService })
+  .run(async (event, { emailService }) => {
+    await emailService.send(event.data.userId);
+  })
+  .build();
+
+const app = r.resource("app")
+  .register([userCreated, sendEmail, emailService])
+  .build();
+
+const { emitEvent, getResourceValue, dispose } = await run(app);
+
+try {
+  // Emit event and verify hook executed
+  await emitEvent(userCreated, { userId: "123" });
+  
+  const mailer = await getResourceValue(emailService);
+  expect(mailer.send).toHaveBeenCalledWith("123");
+} finally {
+  await dispose();
+}
+```
+
+### dispose
+
+**Always** call dispose to clean up resources:
+
+```typescript
+const { dispose } = await run(app);
+
+try {
+  // Your tests
+} finally {
+  await dispose(); // Idempotent - safe to call multiple times
+}
+```
+
+**What dispose does:**
+- Calls `.dispose()` on all resources in reverse initialization order
+- Closes connections, timers, and listeners
+- Cleans up async context stores
+- Unregisters event hooks
+
+## createTestResource (Deprecated)
+
+For reference, here's how `createTestResource` works (but prefer `run()` directly):
+
+```typescript
+import { createTestResource, run } from "@bluelibs/runner";
+
+const myTask = r.task("app.task")
+  .run(async (x: number) => x * 2)
+  .build();
+
+const app = r.resource("app")
+  .register([myTask])
+  .build();
+
+// Creates a test harness resource
+const testHarness = createTestResource(app);
+
+const { value: testFacade, dispose } = await run(testHarness);
+
+try {
+  // testFacade provides: runTask, getResource, taskRunner, store, logger, eventManager
+  const result = await testFacade.runTask(myTask, 21);
+  expect(result).toBe(42);
+} finally {
+  await dispose();
+}
+```
+
+### With Overrides
+
+```typescript
+import { createTestResource, override, run } from "@bluelibs/runner";
+
+const db = r.resource("db")
+  .init(async () => ({ kind: "real" }))
+  .build();
+
+const getDbKind = r.task("app.tasks.getDbKind")
+  .dependencies({ db })
+  .run(async (_, { db }) => db.kind)
+  .build();
+
+const app = r.resource("app")
+  .register([db, getDbKind])
+  .build();
+
+// Create mock override
+const mockDb = override(db, { 
+  init: async () => ({ kind: "mock" }) 
+});
+
+// Pass overrides to createTestResource
+const testHarness = createTestResource(app, { 
+  overrides: [mockDb] 
+});
+
+const { value: testFacade, dispose } = await run(testHarness);
+
+try {
+  const kind = await testFacade.runTask(getDbKind);
+  expect(kind).toBe("mock");
+} finally {
+  await dispose();
+}
+```
+
+## Real-World Test Patterns
+
+### Pattern: Test Fixture Factory
+
+Create reusable test fixtures:
+
+```typescript
+import { r, run, override } from "@bluelibs/runner";
+
+// fixtures.ts
+export async function createTestFixture() {
+  const db = r.resource("app.db")
+    .init(async () => new InMemoryDatabase())
+    .build();
+  
+  const emailService = r.resource("app.emailService")
+    .init(async () => ({ send: jest.fn() }))
+    .build();
+  
+  const app = r.resource("test.app")
+    .register([db, emailService, /* ... other components */])
+    .build();
+  
+  return run(app);
+}
+
+// In tests
+it("creates user", async () => {
+  const { runTask, dispose } = await createTestFixture();
+  
+  try {
+    const user = await runTask(createUser, {
+      name: "Test User",
+      email: "test@example.com"
+    });
+    expect(user.id).toBeDefined();
+  } finally {
+    await dispose();
+  }
+});
+```
+
+### Pattern: Shared Test App
+
+Reuse the same test app across multiple tests:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+describe("User operations", () => {
+  let runtime: Awaited<ReturnType<typeof run>>;
+  
+  beforeAll(async () => {
+    const testApp = r.resource("test.app")
+      .register([/* components */])
+      .overrides([/* test overrides */])
+      .build();
+    
+    runtime = await run(testApp);
+  });
+  
+  afterAll(async () => {
+    await runtime.dispose();
+  });
+  
+  it("creates user", async () => {
+    const user = await runtime.runTask(createUser, { 
+      name: "Alice", 
+      email: "alice@test.com" 
+    });
+    expect(user).toBeDefined();
+  });
+  
+  it("finds user", async () => {
+    const user = await runtime.runTask(findUser, { id: "123" });
+    expect(user).toBeDefined();
+  });
+});
+```
+
+<Warning>
+**Be careful with shared test state!** While this pattern is convenient, it can lead to test interdependencies if tests modify shared resources. Prefer isolated runtimes when tests have side effects.
+</Warning>
+
+### Pattern: Parallel Test Isolation
+
+Run multiple isolated runtimes in parallel:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+it("handles parallel executions", async () => {
+  const app = r.resource("app").register([myTask]).build();
+  
+  // Create multiple isolated runtimes
+  const [runtime1, runtime2] = await Promise.all([
+    run(app),
+    run(app),
+  ]);
+  
+  try {
+    // Execute in parallel - no shared state
+    const [result1, result2] = await Promise.all([
+      runtime1.runTask(myTask, "input1"),
+      runtime2.runTask(myTask, "input2"),
+    ]);
+    
+    expect(result1).not.toEqual(result2);
+  } finally {
+    await Promise.all([
+      runtime1.dispose(),
+      runtime2.dispose(),
+    ]);
+  }
+});
+```
+
+## Next Steps
+
+- **[Mocking](/testing/mocking)** - Learn about mocking dependencies and overriding resources
+- **[Testing Overview](/testing/overview)** - Understand the testing philosophy and strategies

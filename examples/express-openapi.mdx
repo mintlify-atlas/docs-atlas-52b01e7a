@@ -1,0 +1,291 @@
+---
+title: "Express + OpenAPI + SQLite"
+description: "Full-featured Express application with authentication, OpenAPI docs, and custom HTTP tags"
+icon: "server"
+---
+
+## Overview
+
+This example demonstrates a complete Express.js application showcasing the full power of BlueLibs Runner with:
+
+- **Custom HTTP Tags** for declarative route definitions
+- **Event-driven Architecture** with automatic route registration
+- **Authentication** using Passport and JWT
+- **SQLite Database** with user management
+- **Context System** for request-scoped data
+- **OpenAPI/Swagger** documentation
+- **Comprehensive Integration Tests**
+
+## Architecture
+
+The application follows a clean, modular structure:
+
+- **Resources**: Database, Express server, user repository, HTTP route bridge
+- **Tasks**: Register, login, profile, user listing endpoints
+- **Middleware**: JWT authentication and user context setup
+- **Tags**: HTTP route decoration with OpenAPI metadata
+- **Contexts**: Request-scoped data (`UserContext`, `RequestContext`)
+
+## Key Code Snippets
+
+### Custom HTTP Tag
+
+```typescript
+const httpTag = r.tag<HttpRouteConfig>("http.route").build();
+
+export const httpRoute = {
+  get: (path: string, config?: Partial<HttpRouteConfig>) =>
+    httpTag.with({ method: "GET", path, ...config }),
+  
+  post: (path: string, config?: Partial<HttpRouteConfig>) =>
+    httpTag.with({ method: "POST", path, ...config }),
+  
+  // ... other HTTP methods
+};
+```
+
+### Task with HTTP Tag
+
+<CodeGroup>
+
+```typescript Register User Task
+const registerUserTask = r
+  .task("app.tasks.auth.register")
+  .dependencies({ appConfig, createUserTask })
+  .tags([
+    httpRoute.post("/api/auth/register", {
+      summary: "Register a new user",
+      requiresAuth: false,
+      requestBodySchema: z.object({
+        email: z.email(),
+        password: z.string().min(6),
+        name: z.string().min(2),
+      }),
+      responseSchema: z.object({
+        success: z.boolean(),
+        data: z.object({
+          token: z.string(),
+          user: UserSchema,
+        }),
+      }),
+    }),
+  ])
+  .inputSchema(registerSchema)
+  .run(async (userData, { appConfig, createUserTask }) => {
+    const user = await createUserTask(userData);
+    const token = jwt.sign({ userId: user.id }, appConfig.jwtSecret, {
+      expiresIn: "24h",
+    });
+    
+    return {
+      success: true,
+      data: { token, user },
+      message: "User registered successfully",
+    };
+  })
+  .build();
+```
+
+```typescript Auth Middleware
+export const authMiddleware = r.middleware
+  .task<AuthMiddlewareConfig>("app.middleware.auth")
+  .dependencies({ userService: usersRepository, appConfig })
+  .run(async ({ task, next }, { userService, appConfig }, config) => {
+    const { jwtSecret } = appConfig;
+    const { requiresAuth = true } = config;
+    const request = task?.input?.request;
+    
+    if (!request) return next(task?.input);
+    
+    const authHeader = request.headers.authorization;
+    const token = authHeader?.startsWith("Bearer ") 
+      ? authHeader.substring(7) 
+      : null;
+    
+    if (token) {
+      const decoded = jwt.verify(token, jwtSecret) as { userId: string };
+      const user = await userService.getUserById(decoded.userId);
+      
+      const userSession: UserSession = {
+        userId: user.id,
+        email: user.email,
+        name: user.name,
+      };
+      
+      return UserContext.provide(userSession, () => next(task?.input));
+    }
+    
+    if (requiresAuth) {
+      throw new Error("Authentication required");
+    }
+    
+    return next(task?.input);
+  })
+  .build();
+```
+
+</CodeGroup>
+
+### Event-Driven Route Registration
+
+```typescript
+export const routeRegistrationHook = r
+  .hook("app.hooks.routeRegistration")
+  .on(globals.events.ready)
+  .dependencies({
+    store: globals.resources.store,
+    taskRunner: globals.resources.taskRunner,
+    expressServer: expressServerResource,
+  })
+  .run(async (_, { store, taskRunner, expressServer }) => {
+    const allTasks = Array.from(store.tasks.values());
+    
+    allTasks.forEach((taskElement) => {
+      const config = httpTag.extract(taskElement.task);
+      if (!config) return;
+      
+      const { method, path } = config;
+      
+      // Register Express route handler
+      app[method.toLowerCase()](path, async (req, res) => {
+        const taskInput = {
+          ...req.body,
+          ...req.params,
+          ...req.query,
+          request: req,
+          response: res,
+        };
+        
+        const result = await RequestContext.provide(
+          requestData, 
+          () => taskRunner.run(task, taskInput)
+        );
+        
+        res.status(200).json(result);
+      });
+    });
+  })
+  .build();
+```
+
+### Context System
+
+```typescript
+// Define user context
+export const UserContext = createContext<UserSession>("user.session");
+
+// Use in tasks
+const getUserProfileTask = r
+  .task("app.tasks.auth.profile")
+  .run(async () => {
+    const userSession = UserContext.use();
+    return {
+      success: true,
+      data: userSession,
+    };
+  })
+  .build();
+```
+
+## How to Run
+
+<Steps>
+
+<Step title="Clone and install">
+  ```bash
+  git clone git@github.com:bluelibs/runner.git
+  cd runner/examples/express-openapi-sqlite
+  npm install
+  ```
+</Step>
+
+<Step title="Start development server">
+  ```bash
+  PORT=3000 npm run dev
+  ```
+</Step>
+
+<Step title="Test the API">
+  ```bash
+  # Register a user
+  curl -X POST http://localhost:3000/api/auth/register \
+    -H "Content-Type: application/json" \
+    -d '{"email":"test@example.com","password":"password123","name":"Test User"}'
+  
+  # Login
+  curl -X POST http://localhost:3000/api/auth/login \
+    -H "Content-Type: application/json" \
+    -d '{"email":"test@example.com","password":"password123"}'
+  
+  # Access protected route
+  curl -X GET http://localhost:3000/api/auth/profile \
+    -H "Authorization: Bearer YOUR_JWT_TOKEN"
+  ```
+</Step>
+
+<Step title="View API documentation">
+  Open your browser to:
+  ```
+  http://localhost:3000/api-docs
+  ```
+</Step>
+
+<Step title="Run tests">
+  ```bash
+  npm test
+  ```
+</Step>
+
+</Steps>
+
+## API Endpoints
+
+| Method | Endpoint | Description | Auth Required |
+|--------|----------|-------------|---------------|
+| GET | `/health` | Health check | No |
+| POST | `/api/auth/register` | Register new user | No |
+| POST | `/api/auth/login` | User login | No |
+| GET | `/api/auth/profile` | Get user profile | Yes |
+| GET | `/api/users` | Get all users | Yes |
+
+## What to Learn
+
+This example showcases several advanced Runner patterns:
+
+### 1. Declarative Route Definitions
+
+Using tags to declare HTTP routes keeps your task definitions clean and declarative. The route configuration lives alongside the task, making it easy to see the full picture.
+
+### 2. Event-Driven Registration
+
+By hooking into `globals.events.ready`, routes are automatically discovered and registered when the application starts. This eliminates manual route registration boilerplate.
+
+### 3. Context for Request Scope
+
+The `createContext` API provides type-safe, request-scoped data without prop drilling. Authentication middleware sets up user context, which tasks can access anywhere in the call chain.
+
+### 4. Separation of Concerns
+
+- **Tasks** contain pure business logic
+- **Resources** manage infrastructure (database, HTTP server)
+- **Middleware** handles cross-cutting concerns (auth, logging)
+- **Tags** provide metadata for framework features
+
+### 5. Type Safety Throughout
+
+Zod schemas provide runtime validation and compile-time types. OpenAPI docs are automatically generated from these schemas, ensuring your documentation stays in sync with your code.
+
+### 6. Testing Strategy
+
+Integration tests demonstrate the complete authentication flow, from registration to protected route access, including validation and error handling.
+
+## Environment Variables
+
+- `JWT_SECRET`: Secret key for JWT tokens (defaults to 'your-secret-key')
+- `PORT`: The port for the Express HTTP server
+
+## Full Source
+
+View the complete example on GitHub:
+
+[github.com/bluelibs/runner/tree/main/examples/express-openapi-sqlite](https://github.com/bluelibs/runner/tree/main/examples/express-openapi-sqlite)

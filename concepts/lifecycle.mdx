@@ -1,0 +1,419 @@
+---
+title: Application Lifecycle
+description: Understanding the init/run/dispose flow
+---
+
+## What Is the Application Lifecycle?
+
+The application lifecycle in BlueLibs Runner is the **flow from startup to shutdown**. It follows a predictable pattern:
+
+1. **Define** your components (resources, tasks, events, hooks)
+2. **Register** them in a root resource
+3. **Run** the application to initialize everything
+4. **Execute** tasks and emit events
+5. **Dispose** when shutting down
+
+This lifecycle ensures that resources initialize in the correct order, dependencies are resolved, and cleanup happens gracefully.
+
+## The Three Phases
+
+<Steps>
+  <Step title="Init Phase">
+    Resources initialize in dependency order. Databases connect, servers start, caches warm up.
+  </Step>
+  <Step title="Run Phase">
+    Your application is live. Tasks execute, events emit, hooks react.
+  </Step>
+  <Step title="Dispose Phase">
+    Resources clean up in reverse dependency order. Connections close, servers stop, logs flush.
+  </Step>
+</Steps>
+
+## Phase 1: Init
+
+The init phase starts when you call `run(app)`. Here's what happens:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+const db = r
+  .resource("app.db")
+  .init(async () => {
+    console.log("Connecting to database...");
+    const client = await connectToDatabase();
+    console.log("Database connected!");
+    return client;
+  })
+  .build();
+
+const server = r
+  .resource("app.server")
+  .dependencies({ db }) // Depends on db
+  .init(async (_config, { db }) => {
+    console.log("Starting HTTP server...");
+    const app = express();
+    const listener = app.listen(3000);
+    console.log("Server listening on port 3000");
+    return { app, listener };
+  })
+  .build();
+
+const app = r
+  .resource("app")
+  .register([db, server])
+  .build();
+
+// This triggers the init phase
+const runtime = await run(app);
+```
+
+**What happens during init:**
+
+1. Runner analyzes the dependency graph
+2. Resources initialize in **dependency order** (db before server)
+3. Each `init()` function runs once and its return value is cached
+4. Built-in lifecycle events are emitted: `init.before`, `init.after`, `ready`
+
+<Note>
+Init only runs **once per application**. If a resource has already been initialized, its cached value is returned immediately.
+</Note>
+
+## Sequential vs Parallel Init
+
+By default, resources initialize **sequentially** in dependency order. You can enable **parallel initialization** for resources that don't depend on each other:
+
+```typescript
+const runtime = await run(app, {
+  initMode: "parallel", // Initialize independent resources in parallel
+});
+```
+
+<Tip>
+**Parallel init** speeds up startup when you have multiple independent resources (e.g., connecting to different databases or APIs).
+</Tip>
+
+## Phase 2: Run
+
+Once initialization completes, your application is **running**. This is where your business logic executes:
+
+```typescript
+const { runTask, emitEvent, dispose } = await run(app);
+
+// Execute tasks
+const user = await runTask(createUser, {
+  name: "Ada",
+  email: "ada@example.com",
+});
+
+// Emit events
+await emitEvent(userRegistered, {
+  userId: user.id,
+  email: user.email,
+});
+```
+
+**What you can do in the run phase:**
+
+- **Execute tasks** with `runTask(task, input)`
+- **Emit events** with `emitEvent(event, payload)`
+- **Access resource values** with `getResourceValue(resource)`
+- **Get resource configs** with `getResourceConfig(resource)`
+
+<Note>
+The run phase lasts as long as your application is running. For servers, this is until you call `dispose()` or the process exits. For CLI tools, this is the duration of the command.
+</Note>
+
+## Built-in Lifecycle Events
+
+Runner emits lifecycle events you can listen to:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const onReady = r
+  .hook("app.hooks.onReady")
+  .on(globals.events.ready)
+  .dependencies({ logger: globals.resources.logger })
+  .run(async (_, { logger }) => {
+    await logger.info("Application is ready!");
+  })
+  .build();
+
+const onShutdown = r
+  .hook("app.hooks.onShutdown")
+  .on(globals.events.shutdown)
+  .dependencies({ logger: globals.resources.logger })
+  .run(async (_, { logger }) => {
+    await logger.info("Application is shutting down...");
+  })
+  .build();
+```
+
+**Available lifecycle events:**
+
+- `globals.events.ready` - Emitted after all resources initialize
+- `globals.events.shutdown` - Emitted when `dispose()` is called
+- `globals.events.init.before` - Emitted before any resource initializes
+- `globals.events.init.after` - Emitted after all resources initialize
+
+<Tip>
+Use `globals.events.ready` to start servers or schedule cron jobs after all dependencies are ready.
+</Tip>
+
+## Phase 3: Dispose
+
+The dispose phase cleans up resources when your application shuts down:
+
+```typescript
+const db = r
+  .resource("app.db")
+  .init(async () => {
+    const client = await connectToDatabase();
+    return client;
+  })
+  .dispose(async (client) => {
+    console.log("Closing database connection...");
+    await client.close();
+    console.log("Database connection closed!");
+  })
+  .build();
+
+const server = r
+  .resource("app.server")
+  .dependencies({ db })
+  .init(async () => {
+    const app = express();
+    const listener = app.listen(3000);
+    return { app, listener };
+  })
+  .dispose(async ({ listener }) => {
+    console.log("Stopping HTTP server...");
+    return new Promise((resolve) => listener.close(resolve));
+  })
+  .build();
+
+const runtime = await run(app);
+
+// Later, when shutting down:
+await runtime.dispose();
+```
+
+**What happens during dispose:**
+
+1. The `shutdown` event is emitted
+2. Resources dispose in **reverse dependency order** (server before db)
+3. Each `dispose()` function runs once
+4. Shutdown hooks (signal handlers) are called if enabled
+
+<Note>
+**Reverse order**: Dispose runs in the opposite order of init. If db initialized before server, then server disposes before db. This ensures dependents clean up before their dependencies.
+</Note>
+
+## Graceful Shutdown
+
+Enable **automatic shutdown hooks** to handle SIGINT and SIGTERM gracefully:
+
+```typescript
+const runtime = await run(app, {
+  shutdownHooks: true, // Default: automatically installs signal handlers
+});
+
+// When you press Ctrl+C or send SIGTERM:
+// 1. Runner catches the signal
+// 2. Calls runtime.dispose()
+// 3. Cleans up all resources
+// 4. Exits gracefully
+```
+
+<Tip>
+**Production best practice**: Always enable `shutdownHooks: true` in production to ensure clean shutdowns when deploying, scaling, or restarting.
+</Tip>
+
+## Lazy Initialization
+
+By default, all resources initialize eagerly during `run()`. Enable **lazy initialization** to defer initialization until first use:
+
+```typescript
+const runtime = await run(app, {
+  lazy: true, // Don't initialize resources until they're needed
+});
+
+// Resource initializes on first access
+const dbClient = await runtime.getLazyResourceValue(db);
+```
+
+<Note>
+**When to use lazy init**: Use it for resources that are expensive to initialize but not always needed (e.g., optional integrations, feature-flagged services).
+</Note>
+
+## Dry Run Mode
+
+Test your wiring without actually initializing resources:
+
+```typescript
+const runtime = await run(app, {
+  dryRun: true, // Validate wiring without running init()
+});
+
+// Returns immediately after validation
+// Useful in CI pipelines to catch wiring errors
+```
+
+<Tip>
+Use `dryRun: true` in CI to catch dependency errors, circular dependencies, and missing registrations without spinning up databases or servers.
+</Tip>
+
+## Error Handling During Init
+
+If a resource fails to initialize, Runner stops and reports the error:
+
+```typescript
+const db = r
+  .resource("app.db")
+  .init(async () => {
+    throw new Error("Failed to connect to database");
+  })
+  .build();
+
+try {
+  await run(app);
+} catch (err) {
+  console.error("Initialization failed:", err.message);
+  // Error: Failed to connect to database
+}
+```
+
+<Note>
+**Fail-fast principle**: If any resource fails to initialize, the entire initialization stops. This prevents your app from running in a broken state.
+</Note>
+
+## Accessing Resource Values at Runtime
+
+Once your app is running, you can access resource values:
+
+```typescript
+const { getResourceValue, getResourceConfig } = await run(app);
+
+// Get the initialized value
+const dbClient = getResourceValue(db);
+
+// Get the config that was used
+const config = getResourceConfig(db);
+```
+
+<Tip>
+Prefer **dependency injection** in tasks and resources over manually calling `getResourceValue()`. It's more testable and explicit.
+</Tip>
+
+## Real-World Example: Express Server Lifecycle
+
+Here's a complete example showing the full lifecycle:
+
+```typescript src/http/hooks/onReady.hook.ts
+import { r, globals } from "@bluelibs/runner";
+import { fastify } from "#/http/resources/fastify.resource";
+import { env } from "#/general/resources/env.resource";
+
+export const onReady = r
+  .hook("app.http.hooks.onReady")
+  .meta({
+    title: "HTTP Server Ready Hook",
+    description: "Starts the Fastify server when the application is ready",
+  })
+  .on(globals.events.ready)
+  .dependencies({ fastify, logger: globals.resources.logger, env })
+  .run(async (_, { fastify, logger, env }) => {
+    const port = Number(env.PORT || 3000);
+    await fastify.listen({ port });
+    logger.info(`Fastify is listening on port ${port}`);
+    logger.info(`Swagger UI available at http://localhost:${port}/swagger`);
+  })
+  .build();
+```
+
+```typescript src/main.ts
+import { r, run } from "@bluelibs/runner";
+import { db } from "./db/resources";
+import { fastify } from "./http/resources/fastify.resource";
+import { onReady } from "./http/hooks/onReady.hook";
+
+const app = r
+  .resource("app")
+  .register([db, fastify, onReady])
+  .build();
+
+const runtime = await run(app, {
+  shutdownHooks: true, // Install SIGINT/SIGTERM handlers
+});
+
+// Application is now running
+// Server starts when the 'ready' event fires
+// Pressing Ctrl+C triggers graceful shutdown
+```
+
+## Lifecycle Flow Diagram
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 1. Define Components                                        │
+│    r.resource(), r.task(), r.event(), r.hook()              │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Register in Root Resource                                │
+│    .register([db, server, tasks, hooks])                    │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Run Application: run(app)                                │
+│    - Emit init.before                                       │
+│    - Initialize resources in dependency order               │
+│    - Emit init.after                                        │
+│    - Emit ready                                             │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Execute Business Logic                                   │
+│    - runTask(task, input)                                   │
+│    - emitEvent(event, payload)                              │
+│    - Hooks react to events                                  │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 5. Dispose: runtime.dispose()                               │
+│    - Emit shutdown                                          │
+│    - Dispose resources in reverse dependency order          │
+│    - Close connections, stop servers, flush logs            │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## Best Practices
+
+<Steps>
+  <Step title="Always implement dispose">
+    Clean up resources properly to prevent leaks and ensure graceful shutdown.
+  </Step>
+  <Step title="Enable shutdown hooks in production">
+    Use `shutdownHooks: true` to handle SIGINT/SIGTERM gracefully.
+  </Step>
+  <Step title="Handle init errors">
+    Wrap `run(app)` in try-catch to handle initialization failures.
+  </Step>
+  <Step title="Use lifecycle events">
+    React to `ready` and `shutdown` events for startup/cleanup logic.
+  </Step>
+  <Step title="Keep init focused">
+    Resources should initialize state, not perform business logic. Save that for tasks.
+  </Step>
+</Steps>
+
+## Related Concepts
+
+- [Resources](/concepts/resources) - Resources have init/dispose lifecycle
+- [Tasks](/concepts/tasks) - Tasks execute during the run phase
+- [Events](/concepts/events) - Lifecycle events like `ready` and `shutdown`
+- [Hooks](/concepts/hooks) - React to lifecycle events with hooks

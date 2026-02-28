@@ -1,0 +1,530 @@
+---
+title: Rate Limit Middleware
+description: Control execution frequency to prevent overload and protect resources
+---
+
+The rate limit middleware restricts how many times a task can execute within a fixed time window. Once the limit is reached, subsequent executions fail immediately with a `RateLimitError` until the window resets.
+
+## When to Use Rate Limiting
+
+<CardGroup cols={2}>
+  <Card title="External APIs" icon="cloud">
+    Respect third-party rate limits
+  </Card>
+  <Card title="Database protection" icon="database">
+    Prevent query storms that overload your database
+  </Card>
+  <Card title="User actions" icon="user">
+    Limit how often users can perform actions (e.g., sending emails)
+  </Card>
+  <Card title="Resource-intensive tasks" icon="microchip">
+    Throttle CPU/memory-heavy operations
+  </Card>
+</CardGroup>
+
+## Quick Start
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const sendEmail = r
+  .task("email.send")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 60000,  // 1 minute window
+      max: 10,          // Allow 10 requests per window
+    })
+  ])
+  .run(async (email: EmailInput) => {
+    return emailService.send(email);
+  })
+  .build();
+```
+
+This task can be called at most 10 times per minute. The 11th call within a minute will throw a `RateLimitError`.
+
+## Configuration
+
+<ParamField path="windowMs" type="number" required>
+  Time window in milliseconds. The rate limit resets after this duration.
+  
+  **Example:** `60000` = 1 minute window
+</ParamField>
+
+<ParamField path="max" type="number" required>
+  Maximum number of executions allowed within the window.
+  
+  **Example:** `10` = allow 10 executions per window
+</ParamField>
+
+<Warning>
+Both `windowMs` and `max` are **required**. The middleware will throw a `TypeError` if either is missing or invalid.
+</Warning>
+
+## Examples
+
+### Basic Rate Limiting
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const callAPI = r
+  .task("api.external")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 1000,  // 1 second
+      max: 5,          // 5 requests per second
+    })
+  ])
+  .run(async (url: string) => {
+    return fetch(url).then(r => r.json());
+  })
+  .build();
+```
+
+### Different Limits for Different Operations
+
+```typescript
+// Strict limit for expensive operations
+const generateReport = r
+  .task("reports.generate")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 3600000, // 1 hour
+      max: 5,            // 5 reports per hour
+    })
+  ])
+  .run(async (reportId: string) => createReport(reportId))
+  .build();
+
+// Lenient limit for lightweight operations
+const getStatus = r
+  .task("status.get")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 1000, // 1 second
+      max: 100,       // 100 requests per second
+    })
+  ])
+  .run(async () => getSystemStatus())
+  .build();
+```
+
+### Handling Rate Limit Errors
+
+```typescript
+import { r, globals, run } from "@bluelibs/runner";
+import { RateLimitError } from "@bluelibs/runner/globals/middleware/rateLimit.middleware";
+
+const sendNotification = r
+  .task("notifications.send")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 60000,
+      max: 10,
+    })
+  ])
+  .run(async (message: string) => notificationService.send(message))
+  .build();
+
+const app = r.resource("app").register([sendNotification]).build();
+const { runTask, dispose } = await run(app);
+
+try {
+  await runTask(sendNotification, "Hello!");
+} catch (error) {
+  if (error instanceof RateLimitError) {
+    console.error("Rate limit exceeded:", error.message);
+    // "Rate limit exceeded. Try again after 2024-01-15T10:30:00.000Z"
+    
+    // Wait and retry
+    await new Promise(resolve => setTimeout(resolve, 60000));
+    await runTask(sendNotification, "Hello!");
+  }
+}
+
+await dispose();
+```
+
+## Execution Journal
+
+The rate limit middleware exposes state via the execution journal:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/rateLimit.middleware";
+
+const monitoredTask = r
+  .task("api.monitored")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 60000,
+      max: 10,
+    })
+  ])
+  .run(async (input, deps, { journal }) => {
+    // Check remaining quota
+    const remaining = journal.get(journalKeys.remaining); // e.g., 7
+    const resetTime = journal.get(journalKeys.resetTime); // Unix timestamp
+    const limit = journal.get(journalKeys.limit);         // 10
+    
+    console.log(`${remaining}/${limit} requests remaining`);
+    console.log(`Window resets at ${new Date(resetTime)}`);
+    
+    // Warn when approaching limit
+    if (remaining < 3) {
+      console.warn("Approaching rate limit!");
+    }
+    
+    return processData(input);
+  })
+  .build();
+```
+
+### Journal Keys
+
+<ParamField path="journalKeys.remaining" type="number">
+  Number of remaining requests in the current window
+</ParamField>
+
+<ParamField path="journalKeys.resetTime" type="number">
+  Unix timestamp (milliseconds) when the current window resets
+</ParamField>
+
+<ParamField path="journalKeys.limit" type="number">
+  Maximum requests allowed per window (same as `max` config)
+</ParamField>
+
+## Combining with Other Middleware
+
+### Rate Limit + Retry
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const resilientAPI = r
+  .task("api.resilient")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 1000,
+      max: 5,
+    }),
+    globals.middleware.task.retry.with({ retries: 3 }),
+  ])
+  .run(async (url: string) => fetch(url).then(r => r.json()))
+  .build();
+```
+
+<Warning>
+**Order matters!** With this configuration, retries count against the rate limit. If the first request succeeds but a later request hits the rate limit, the retry won't help.
+
+Consider: Do you want retries to consume quota? If not, reverse the order.
+</Warning>
+
+### Rate Limit + Timeout
+
+```typescript
+const timedAPI = r
+  .task("api.timed")
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 60000,
+      max: 100,
+    }),
+    globals.middleware.task.timeout.with({ ttl: 5000 }),
+  ])
+  .run(async (url: string) => fetch(url).then(r => r.json()))
+  .build();
+```
+
+Timeouts don't consume quota—if a request times out before checking the rate limit, it won't count.
+
+## Common Patterns
+
+### Per-User Rate Limiting
+
+The default rate limit is per-task. For per-user limits, use custom middleware:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const perUserRateLimit = r.middleware
+  .task("app.middleware.perUserRateLimit")
+  .run(async ({ task, next }, deps, config: { windowMs: number; max: number }) => {
+    const userId = task.input.userId;
+    const state = getUserRateLimitState(userId); // Your state management
+    
+    const now = Date.now();
+    if (now >= state.resetTime) {
+      state.count = 0;
+      state.resetTime = now + config.windowMs;
+    }
+    
+    if (state.count >= config.max) {
+      throw new Error(
+        `Rate limit exceeded for user ${userId}. Try again after ${new Date(state.resetTime).toISOString()}`
+      );
+    }
+    
+    state.count++;
+    return next(task.input);
+  })
+  .build();
+
+const sendEmail = r
+  .task("email.send")
+  .middleware([
+    perUserRateLimit.with({ windowMs: 60000, max: 5 })
+  ])
+  .run(async (input: { userId: string; message: string }) => {
+    return emailService.send(input.message);
+  })
+  .build();
+```
+
+### Rate Limit with Queueing
+
+Instead of failing, queue excess requests:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/rateLimit.middleware";
+
+const queuedTask = r
+  .task("api.queued")
+  .dependencies({ queue: globals.resources.queue })
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 1000,
+      max: 5,
+    })
+  ])
+  .run(async (input, { queue }, { journal }) => {
+    const remaining = journal.get(journalKeys.remaining);
+    
+    if (remaining === 0) {
+      // Queue for later
+      const resetTime = journal.get(journalKeys.resetTime);
+      const delay = resetTime - Date.now();
+      
+      return queue.run(`rate-limit-queue`, async () => {
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return processData(input);
+      });
+    }
+    
+    return processData(input);
+  })
+  .build();
+```
+
+### Rate Limit with Metrics
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+import { journalKeys } from "@bluelibs/runner/globals/middleware/rateLimit.middleware";
+
+const meteredTask = r
+  .task("api.metered")
+  .dependencies({ logger: globals.resources.logger })
+  .middleware([
+    globals.middleware.task.rateLimit.with({
+      windowMs: 60000,
+      max: 100,
+    })
+  ])
+  .run(async (input, { logger }, { journal }) => {
+    const remaining = journal.get(journalKeys.remaining);
+    const limit = journal.get(journalKeys.limit);
+    
+    // Track quota usage
+    const usagePercent = ((limit - remaining) / limit) * 100;
+    metrics.gauge('rate_limit.usage_percent', usagePercent);
+    
+    // Alert when approaching limit
+    if (usagePercent > 80) {
+      await logger.warn("Rate limit approaching", {
+        data: { remaining, limit, usagePercent }
+      });
+    }
+    
+    return processData(input);
+  })
+  .build();
+```
+
+### Adaptive Rate Limiting
+
+Adjust limits based on system load:
+
+```typescript
+const adaptiveTask = r
+  .task("api.adaptive")
+  .run(async (input, deps, { journal }) => {
+    const systemLoad = await getSystemLoad();
+    const maxRequests = systemLoad > 0.8 ? 5 : 20;
+    
+    // Implement custom rate limiting based on system load
+    // (This requires custom middleware, as the built-in middleware has fixed config)
+    
+    return processData(input);
+  })
+  .build();
+```
+
+## Rate Limit Resource
+
+The rate limit middleware uses a shared resource to maintain state:
+
+```typescript
+import { rateLimitResource } from "@bluelibs/runner/globals/middleware/rateLimit.middleware";
+
+// The resource is automatically registered when you use the middleware
+// State is stored in a WeakMap keyed by config object
+```
+
+<Note>
+Rate limit state is **per middleware configuration instance**, not per task. Tasks that share the same config object share the same rate limit.
+</Note>
+
+## Shared Rate Limits
+
+To share a rate limit across multiple tasks, reuse the same config object:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+// Shared config = shared rate limit
+const apiLimitConfig = { windowMs: 60000, max: 100 };
+
+const taskA = r
+  .task("api.taskA")
+  .middleware([globals.middleware.task.rateLimit.with(apiLimitConfig)])
+  .run(async (input) => fetchA(input))
+  .build();
+
+const taskB = r
+  .task("api.taskB")
+  .middleware([globals.middleware.task.rateLimit.with(apiLimitConfig)])
+  .run(async (input) => fetchB(input))
+  .build();
+
+// taskA and taskB share the same 100 requests/minute limit
+```
+
+For independent limits, use separate config objects:
+
+```typescript
+const taskA = r
+  .task("api.taskA")
+  .middleware([globals.middleware.task.rateLimit.with({ windowMs: 60000, max: 100 })])
+  .run(async (input) => fetchA(input))
+  .build();
+
+const taskB = r
+  .task("api.taskB")
+  .middleware([globals.middleware.task.rateLimit.with({ windowMs: 60000, max: 100 })])
+  .run(async (input) => fetchB(input))
+  .build();
+
+// taskA and taskB have independent limits
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Set limits based on actual constraints">
+    Don't guess—measure your system's capacity:
+    ```typescript
+    // Example: API allows 1000 req/hour
+    windowMs: 3600000, // 1 hour
+    max: 1000,
+    
+    // Example: Database can handle 100 queries/second
+    windowMs: 1000,
+    max: 100,
+    ```
+  </Accordion>
+
+  <Accordion title="Monitor rate limit hits in production">
+    Track when limits are reached to tune configuration:
+    ```typescript
+    try {
+      return await runTask(myTask, input);
+    } catch (error) {
+      if (error instanceof RateLimitError) {
+        metrics.increment('rate_limit.exceeded');
+        logger.warn('Rate limit hit', { task: 'myTask' });
+      }
+      throw error;
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Use longer windows for expensive operations">
+    Short windows can cause bursty behavior:
+    ```typescript
+    // Bad: allows bursts every second
+    windowMs: 1000, max: 10,
+    
+    // Better: smooth out over a minute
+    windowMs: 60000, max: 600,
+    ```
+  </Accordion>
+
+  <Accordion title="Provide clear error messages">
+    Tell users when they can try again:
+    ```typescript
+    if (error instanceof RateLimitError) {
+      // error.message includes reset time
+      return {
+        error: "Rate limit exceeded",
+        retryAfter: new Date(resetTime),
+      };
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="Consider queueing instead of failing">
+    For background jobs, queue excess requests:
+    ```typescript
+    if (remaining === 0) {
+      const delay = resetTime - Date.now();
+      await new Promise(r => setTimeout(r, delay));
+      return processRequest();
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Error Details
+
+The `RateLimitError` extends `RunnerError`:
+
+```typescript
+import { RateLimitError } from "@bluelibs/runner/globals/middleware/rateLimit.middleware";
+
+try {
+  await runTask(myTask, input);
+} catch (error) {
+  if (error instanceof RateLimitError) {
+    console.log(error.message);  // "Rate limit exceeded. Try again after 2024-01-15T10:30:00.000Z"
+    console.log(error.id);       // "runner.errors.middlewareRateLimitExceeded"
+    console.log(error.httpCode); // 429 (Too Many Requests)
+  }
+}
+```
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="Circuit Breaker" icon="circle-exclamation" href="/middleware/circuit-breaker">
+    Fail fast when services are unavailable
+  </Card>
+  <Card title="Concurrency Middleware" icon="arrows-spin" href="/middleware/custom#concurrency-pattern">
+    Limit parallel executions
+  </Card>
+  <Card title="Cache Middleware" icon="database" href="/middleware/cache">
+    Reduce load with caching
+  </Card>
+</CardGroup>

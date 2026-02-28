@@ -1,0 +1,312 @@
+---
+title: "Event Builder"
+description: "Fluent API for defining events"
+---
+
+## Overview
+
+The event builder provides a fluent interface for defining strongly-typed events that can be emitted throughout your application. Events trigger hooks and enable decoupled communication between components.
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const userRegistered = r.event("app.events.user.registered")
+  .payloadSchema<{ userId: string; email: string; timestamp: Date }>({
+    parse: (v) => v
+  })
+  .meta({
+    title: "User Registered",
+    description: "Emitted when a new user successfully registers",
+  })
+  .build();
+```
+
+## Methods
+
+### payloadSchema() / schema()
+
+Defines the validation schema for event payload.
+
+```typescript
+.payloadSchema<TPayload>(schema: IValidationSchema<TPayload>)
+.schema<TPayload>(schema: IValidationSchema<TPayload>) // Alias
+```
+
+<ParamField path="schema" type="IValidationSchema<TPayload>" required>
+  Validation schema with a `parse` method that validates and transforms payload.
+  
+  ```typescript
+  .payloadSchema<{ orderId: string; amount: number }>({
+    parse: (payload) => {
+      if (payload.amount < 0) {
+        throw new Error('Amount must be positive');
+      }
+      return payload;
+    }
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with updated payload type
+
+### parallel()
+
+Enables parallel execution for event listeners.
+
+```typescript
+.parallel(enabled?: boolean)
+```
+
+<ParamField path="enabled" type="boolean" default="true">
+  When `true`, listeners with the same `order` run concurrently within a batch. Batches execute sequentially in ascending order priority.
+  
+  ```typescript
+  .parallel(true) // Listeners run in parallel within same order
+  .parallel(false) // All listeners run sequentially
+  ```
+</ParamField>
+
+**Returns:** New builder with parallel setting configured
+
+### tags()
+
+Attaches tags for grouping and filtering.
+
+```typescript
+.tags<TTags>(
+  tags: TagType[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="tags" type="TagType[]" required>
+  Array of tag definitions.
+  
+  ```typescript
+  const criticalTag = r.tag('app.tags.critical').build();
+  
+  .tags([criticalTag, globals.tags.debug])
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing tags. When `false` (default), appends to existing.
+</ParamField>
+
+**Returns:** New builder with tags attached
+
+### meta()
+
+Attaches metadata for documentation and tooling.
+
+```typescript
+.meta<TMeta>(metadata: IEventMeta)
+```
+
+<ParamField path="metadata" type="IEventMeta" required>
+  Metadata object with optional `title` and `description`.
+  
+  ```typescript
+  .meta({
+    title: "Order Processed",
+    description: "Emitted when an order completes processing successfully",
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with metadata attached
+
+### throws()
+
+Documents which errors hooks listening to this event may throw.
+
+```typescript
+.throws(errorList: ThrowsList)
+```
+
+<ParamField path="errorList" type="ThrowsList" required>
+  Array of error classes that hooks might throw. This is declarative only (for documentation).
+  
+  ```typescript
+  .throws([NetworkError, TimeoutError])
+  ```
+</ParamField>
+
+**Returns:** New builder with error documentation
+
+### build()
+
+Builds and returns the final event definition.
+
+```typescript
+.build(): IEvent<TPayload>
+```
+
+**Returns:** Immutable event definition ready to register
+
+## Type Signature
+
+```typescript
+interface EventFluentBuilder<TPayload = void> {
+  id: string;
+  payloadSchema<TNew>(schema: IValidationSchema<TNew>): EventFluentBuilder<TNew>;
+  schema<TNew>(schema: IValidationSchema<TNew>): EventFluentBuilder<TNew>;
+  parallel(enabled?: boolean): EventFluentBuilder<TPayload>;
+  tags<TNewTags extends TagType[]>(t: TNewTags, options?: { override?: boolean }): EventFluentBuilder<TPayload>;
+  meta<TNewMeta extends IEventMeta>(m: TNewMeta): EventFluentBuilder<TPayload>;
+  throws(list: ThrowsList): EventFluentBuilder<TPayload>;
+  build(): IEvent<TPayload>;
+}
+```
+
+## Examples
+
+### Simple Event (No Payload)
+
+```typescript
+const appReady = r.event("app.events.ready")
+  .meta({
+    title: "Application Ready",
+    description: "Emitted when application finishes initialization",
+  })
+  .build();
+
+// Emit:
+await runtime.emitEvent(appReady);
+```
+
+### Event with Payload
+
+```typescript
+const userRegistered = r.event("app.events.user.registered")
+  .payloadSchema<{ userId: string; email: string }>({
+    parse: (v) => {
+      if (!v.userId || !v.email) {
+        throw new Error('Invalid user registration payload');
+      }
+      return v;
+    }
+  })
+  .build();
+
+// Emit:
+await runtime.emitEvent(userRegistered, {
+  userId: "123",
+  email: "user@example.com",
+});
+```
+
+### Event with Parallel Execution
+
+```typescript
+const dataUpdated = r.event("app.events.data.updated")
+  .payloadSchema<{ id: string; data: any }>({ parse: (v) => v })
+  .parallel(true) // Hooks run in parallel (within same order)
+  .meta({
+    title: "Data Updated",
+    description: "Emitted when data is modified",
+  })
+  .build();
+```
+
+### Event with Tags
+
+```typescript
+const criticalTag = r.tag('app.tags.critical').build();
+const securityTag = r.tag('app.tags.security').build();
+
+const securityBreach = r.event("app.events.security.breach")
+  .payloadSchema<{ severity: string; details: string }>({ parse: (v) => v })
+  .tags([criticalTag, securityTag])
+  .parallel(false) // Run hooks sequentially for critical security events
+  .meta({
+    title: "Security Breach Detected",
+    description: "Emitted when a security breach is detected",
+  })
+  .throws([AlertError, LoggingError])
+  .build();
+```
+
+### Domain Events
+
+```typescript
+// Order domain events
+const orderCreated = r.event("app.events.order.created")
+  .payloadSchema<{ orderId: string; customerId: string; total: number }>({ parse: (v) => v })
+  .build();
+
+const orderPaid = r.event("app.events.order.paid")
+  .payloadSchema<{ orderId: string; paymentId: string }>({ parse: (v) => v })
+  .build();
+
+const orderShipped = r.event("app.events.order.shipped")
+  .payloadSchema<{ orderId: string; trackingNumber: string }>({ parse: (v) => v })
+  .build();
+
+const orderDelivered = r.event("app.events.order.delivered")
+  .payloadSchema<{ orderId: string; deliveredAt: Date }>({ parse: (v) => v })
+  .build();
+```
+
+## Usage Pattern
+
+### Define Event
+
+```typescript
+const userLoggedIn = r.event("app.events.user.loggedIn")
+  .payloadSchema<{ userId: string; timestamp: Date }>({ parse: (v) => v })
+  .build();
+```
+
+### Emit Event
+
+```typescript
+// From within a task
+.run(async ({ input, runtime }) => {
+  // ... login logic
+  await runtime.emitEvent(userLoggedIn, {
+    userId: input.userId,
+    timestamp: new Date(),
+  });
+});
+
+// From runtime instance
+await runtime.emitEvent(userLoggedIn, {
+  userId: "123",
+  timestamp: new Date(),
+});
+```
+
+### Listen to Event (Hook)
+
+```typescript
+const trackLogin = r.hook("app.hooks.trackLogin")
+  .on(userLoggedIn)
+  .run(async ({ payload, logger }) => {
+    await logger.info(`User ${payload.userId} logged in at ${payload.timestamp}`);
+    await analytics.track('login', { userId: payload.userId });
+  })
+  .build();
+```
+
+## Emission Options
+
+When emitting events, you can pass options:
+
+```typescript
+await runtime.emitEvent(myEvent, payload, {
+  report: true, // Get detailed emission report
+  failureMode: 'continue', // Continue on hook failure
+  throwOnError: false, // Don't throw if hooks fail
+});
+```
+
+See [Runtime - emitEvent()](/api/runtime/runtime#emitevent) for details.
+
+## Related
+
+- [r namespace](/api/r)
+- [Hook Builder](/api/builders/hook) - Listening to events
+- [Runtime - emitEvent()](/api/runtime/runtime#emitevent)
+- [Events Guide](/concepts/events)
+- [Hooks Guide](/concepts/hooks)

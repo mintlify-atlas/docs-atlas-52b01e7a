@@ -1,0 +1,496 @@
+---
+title: Error Handling
+description: Typed error handling patterns with RunnerError and error contracts
+---
+
+Runner provides a structured approach to error handling with **typed errors**, **error contracts**, and **error boundaries**. Instead of throwing generic `Error` objects, define error types with metadata, HTTP codes, and remediation steps.
+
+## Why Typed Errors?
+
+<CardGroup cols={2}>
+  <Card title="Type Safety" icon="shield-check">
+    Catch specific error types with full TypeScript support
+  </Card>
+  
+  <Card title="HTTP Integration" icon="cloud">
+    Map errors to HTTP status codes automatically
+  </Card>
+  
+  <Card title="Remediation" icon="life-ring">
+    Include user-facing solutions in error definitions
+  </Card>
+  
+  <Card title="Observability" icon="chart-line">
+    Structured error data for logs and monitoring
+  </Card>
+</CardGroup>
+
+## Basic Usage
+
+Define errors with `r.error()` and use them anywhere:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+// Define a typed error
+const InvalidCredentials = r
+  .error<{ email: string }>("app.errors.InvalidCredentials")
+  .httpCode(401)
+  .remediation("Check that the email and password are correct.")
+  .format((data) => `Invalid credentials for ${data.email}`)
+  .build();
+
+// Throw it
+try {
+  await login({ email: "ada@example.com", password: "wrong" });
+} catch (err) {
+  InvalidCredentials.throw({ email: "ada@example.com" });
+}
+
+// Catch it
+try {
+  await login(credentials);
+} catch (err) {
+  if (InvalidCredentials.is(err)) {
+    console.log(err.data.email);    // "ada@example.com"
+    console.log(err.httpCode);      // 401
+    console.log(err.remediation);   // "Check that..."
+  }
+}
+```
+
+## RunnerError Class
+
+All errors created with `r.error()` extend `RunnerError`:
+
+```typescript
+export class RunnerError<TData = any> extends Error {
+  id: string;           // Error identifier
+  data: TData;          // Typed error data
+  httpCode?: number;    // HTTP status code
+  remediation?: string; // User-facing solution
+  message: string;      // Formatted message
+}
+```
+
+## Defining Errors
+
+### Basic Error
+
+```typescript
+const NotFound = r
+  .error<{ resourceId: string }>("app.errors.NotFound")
+  .build();
+
+// Throw with data
+NotFound.throw({ resourceId: "user-123" });
+```
+
+### With HTTP Code
+
+```typescript
+const Unauthorized = r
+  .error<{ reason: string }>("app.errors.Unauthorized")
+  .httpCode(403)
+  .format((data) => `Unauthorized: ${data.reason}`)
+  .build();
+```
+
+### With Remediation
+
+```typescript
+const QuotaExceeded = r
+  .error<{ limit: number; current: number }>("app.errors.QuotaExceeded")
+  .httpCode(429)
+  .format((data) => `Quota exceeded: ${data.current}/${data.limit}`)
+  .remediation((data) => 
+    `You've reached your limit of ${data.limit}. Upgrade your plan to continue.`
+  )
+  .build();
+```
+
+### With Validation Schema
+
+```typescript
+import { z } from "zod";
+
+const ValidationError = r
+  .error<{ field: string; message: string }>("app.errors.ValidationError")
+  .httpCode(400)
+  .dataSchema(z.object({
+    field: z.string(),
+    message: z.string(),
+  }))
+  .format((data) => `Validation failed: ${data.field} - ${data.message}`)
+  .build();
+```
+
+## Error Methods
+
+<ParamField path="throw" type="function">
+  Throw the error with data
+  
+  ```typescript
+  throw(data: TData): never
+  ```
+  
+  ```typescript
+  NotFound.throw({ resourceId: "user-123" });
+  ```
+</ParamField>
+
+<ParamField path="new" type="function">
+  Create error instance without throwing
+  
+  ```typescript
+  new(data: TData): RunnerError<TData>
+  ```
+  
+  ```typescript
+  const error = NotFound.new({ resourceId: "user-123" });
+  console.log(error.message);
+  ```
+</ParamField>
+
+<ParamField path="is" type="function">
+  Type guard to check if error matches
+  
+  ```typescript
+  is(error: unknown): error is RunnerError<TData>
+  is(error: unknown, partialData: Partial<TData>): error is RunnerError<TData>
+  ```
+  
+  ```typescript
+  if (NotFound.is(err)) {
+    console.log(err.data.resourceId);
+  }
+  
+  // Check with partial data match
+  if (NotFound.is(err, { resourceId: "user-123" })) {
+    console.log("Specific user not found");
+  }
+  ```
+</ParamField>
+
+<ParamField path="optional" type="function">
+  Mark error as optional dependency
+  
+  ```typescript
+  optional(): { inner: IErrorHelper<TData>; [symbolOptionalDependency]: true }
+  ```
+</ParamField>
+
+## Error Contracts
+
+Declare which errors a task can throw:
+
+```typescript
+const getUser = r
+  .task("users.get")
+  .dependencies({ db })
+  .throws([NotFound, DatabaseError]) // ← Declare possible errors
+  .run(async (input: { id: string }, { db }) => {
+    const user = await db.users.findOne({ id: input.id });
+    if (!user) {
+      NotFound.throw({ resourceId: input.id });
+    }
+    return user;
+  })
+  .build();
+
+// Query all errors a task can throw
+const possibleErrors = getUser.throws; // [NotFound, DatabaseError]
+```
+
+## Checking Error Types
+
+### Generic RunnerError Check
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+try {
+  await someOperation();
+} catch (err) {
+  if (r.error.is(err)) {
+    console.log("Runner error:", err.id);
+    console.log("Error data:", err.data);
+    console.log("HTTP code:", err.httpCode);
+  }
+}
+```
+
+### Specific Error Check
+
+```typescript
+try {
+  await getUser({ id: "123" });
+} catch (err) {
+  if (NotFound.is(err)) {
+    console.log("User not found:", err.data.resourceId);
+  } else if (DatabaseError.is(err)) {
+    console.log("Database connection failed");
+  } else {
+    throw err; // Re-throw unknown errors
+  }
+}
+```
+
+### Partial Data Matching
+
+```typescript
+const ApiError = r
+  .error<{ endpoint: string; statusCode: number }>("app.errors.ApiError")
+  .build();
+
+try {
+  await callApi();
+} catch (err) {
+  // Check if error is ApiError with specific status code
+  if (ApiError.is(err, { statusCode: 404 })) {
+    console.log("Endpoint not found:", err.data.endpoint);
+  } else if (ApiError.is(err, { statusCode: 500 })) {
+    console.log("Server error");
+  }
+}
+```
+
+## Error Boundaries
+
+Catch unhandled errors at the process level:
+
+```typescript
+import { run } from "@bluelibs/runner";
+
+const { runTask, dispose } = await run(app, {
+  errorBoundary: true, // Enable error boundary
+  onUnhandledError: async ({ error, kind }) => {
+    console.error(`Unhandled ${kind}:`, error);
+    
+    if (r.error.is(error)) {
+      // Log structured error data
+      await logger.error("Unhandled Runner error", {
+        errorId: error.id,
+        data: error.data,
+        httpCode: error.httpCode,
+      });
+    }
+    
+    // Don't exit in development
+    if (process.env.NODE_ENV !== "development") {
+      process.exit(1);
+    }
+  },
+});
+```
+
+## Built-in Errors
+
+Runner provides common error types:
+
+```typescript
+import {
+  contextError,
+  platformUnsupportedFunctionError,
+} from "@bluelibs/runner";
+
+// Context not available
+try {
+  const ctx = requestContext.use();
+} catch (err) {
+  if (contextError.is(err)) {
+    console.error("Context not available");
+  }
+}
+
+// Platform feature not supported
+try {
+  const ctx = r.asyncContext("myContext").build();
+} catch (err) {
+  if (platformUnsupportedFunctionError.is(err)) {
+    console.error("Async context not available on this platform");
+  }
+}
+```
+
+## HTTP Status Codes
+
+Define errors with standard HTTP codes:
+
+```typescript
+const errors = {
+  BadRequest: r.error("app.errors.BadRequest").httpCode(400).build(),
+  Unauthorized: r.error("app.errors.Unauthorized").httpCode(401).build(),
+  Forbidden: r.error("app.errors.Forbidden").httpCode(403).build(),
+  NotFound: r.error("app.errors.NotFound").httpCode(404).build(),
+  Conflict: r.error("app.errors.Conflict").httpCode(409).build(),
+  TooManyRequests: r.error("app.errors.TooManyRequests").httpCode(429).build(),
+  InternalError: r.error("app.errors.InternalError").httpCode(500).build(),
+};
+```
+
+HTTP codes must be integers between 100 and 599.
+
+## Express Integration
+
+```typescript
+import express from "express";
+import { r } from "@bluelibs/runner";
+
+const app = express();
+
+// Error handler middleware
+app.use((err: any, req: any, res: any, next: any) => {
+  if (r.error.is(err)) {
+    res.status(err.httpCode || 500).json({
+      error: err.id,
+      message: err.message,
+      data: err.data,
+      remediation: err.remediation,
+    });
+  } else {
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Route handler
+app.get("/users/:id", async (req, res, next) => {
+  try {
+    const user = await runtime.runTask(getUser, { id: req.params.id });
+    res.json(user);
+  } catch (err) {
+    next(err); // Express error middleware handles it
+  }
+});
+```
+
+## Dynamic Remediation
+
+```typescript
+const InsufficientFunds = r
+  .error<{ required: number; available: number }>("app.errors.InsufficientFunds")
+  .httpCode(402)
+  .format((data) => 
+    `Insufficient funds: need $${data.required}, have $${data.available}`
+  )
+  .remediation((data) => {
+    const difference = data.required - data.available;
+    return `Add $${difference} to your account to complete this transaction.`;
+  })
+  .build();
+
+InsufficientFunds.throw({ required: 100, available: 50 });
+// Message: "Insufficient funds: need $100, have $50"
+// Remediation: "Add $50 to your account to complete this transaction."
+```
+
+## Error Metadata
+
+```typescript
+const DatabaseError = r
+  .error<{ query: string; code?: string }>("app.errors.DatabaseError")
+  .httpCode(500)
+  .meta({
+    description: "Database operation failed",
+    category: "database",
+    severity: "high",
+  })
+  .build();
+
+console.log(DatabaseError.meta);
+// { description: "...", category: "database", severity: "high" }
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Use Semantic IDs" icon="tag">
+    Name errors clearly: `app.errors.InvalidCredentials`, not `error1`
+  </Card>
+  
+  <Card title="Include Context" icon="circle-info">
+    Add relevant data to error objects for debugging
+  </Card>
+  
+  <Card title="Provide Remediation" icon="wrench">
+    Tell users how to fix the problem, not just what went wrong
+  </Card>
+  
+  <Card title="Use Error Contracts" icon="file-contract">
+    Declare possible errors with `.throws()` for documentation
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Validation Errors
+
+```typescript
+const ValidationError = r
+  .error<{ field: string; rule: string; value: unknown }>("app.errors.ValidationError")
+  .httpCode(400)
+  .format((data) => `Validation failed: ${data.field} ${data.rule}`)
+  .remediation((data) => `Check the value for ${data.field} and try again.`)
+  .build();
+
+if (input.email && !isValidEmail(input.email)) {
+  ValidationError.throw({
+    field: "email",
+    rule: "must be a valid email address",
+    value: input.email,
+  });
+}
+```
+
+### Retry with Error Filtering
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+const callApi = r
+  .task("api.call")
+  .middleware([
+    globals.middleware.task.retry.with({
+      retries: 3,
+      stopRetryIf: (error) => {
+        // Don't retry 4xx errors
+        if (r.error.is(error) && error.httpCode) {
+          return error.httpCode >= 400 && error.httpCode < 500;
+        }
+        return false;
+      },
+    }),
+  ])
+  .run(async (url: string) => {
+    const res = await fetch(url);
+    if (!res.ok) {
+      ApiError.throw({ statusCode: res.status, endpoint: url });
+    }
+    return res.json();
+  })
+  .build();
+```
+
+### Error Wrapping
+
+```typescript
+const ExternalApiError = r
+  .error<{ originalError: string }>("app.errors.ExternalApiError")
+  .httpCode(502)
+  .build();
+
+try {
+  await thirdPartyApi.call();
+} catch (err) {
+  ExternalApiError.throw({
+    originalError: err instanceof Error ? err.message : String(err),
+  });
+}
+```
+
+## See Also
+
+- [Tasks](/concepts/tasks) - Task execution and error handling
+- [Middleware](/middleware/overview) - Error handling in middleware
+- [Testing](/testing/overview) - Testing error scenarios
+- [Logging](/guides/troubleshooting) - Structured error logging

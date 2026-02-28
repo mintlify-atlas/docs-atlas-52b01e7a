@@ -1,0 +1,368 @@
+---
+title: "Task Builder"
+description: "Fluent API for defining tasks"
+---
+
+## Overview
+
+The task builder provides a fluent interface for defining executable units of work. Tasks can have typed inputs/outputs, dependencies, middleware, and validation schemas.
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const greet = r.task("app.tasks.greet")
+  .inputSchema<{ name: string }>({ parse: (v) => v })
+  .dependencies(() => ({ logger: globals.resources.logger }))
+  .run(async ({ input, deps }) => {
+    await deps.logger.info(`Greeting ${input.name}`);
+    return `Hello, ${input.name}!`;
+  })
+  .build();
+```
+
+## Methods
+
+### inputSchema() / schema()
+
+Defines the validation schema for task input.
+
+```typescript
+.inputSchema<TInput>(schema: IValidationSchema<TInput>)
+.schema<TInput>(schema: IValidationSchema<TInput>) // Alias
+```
+
+<ParamField path="schema" type="IValidationSchema<TInput>" required>
+  Validation schema with a `parse` method that validates and transforms input.
+  
+  ```typescript
+  .inputSchema<{ email: string }>({
+    parse: (value) => {
+      if (!value.email?.includes('@')) {
+        throw new Error('Invalid email');
+      }
+      return value;
+    }
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with updated input type
+
+### resultSchema()
+
+Defines the validation schema for task output.
+
+```typescript
+.resultSchema<TOutput>(schema: IValidationSchema<TOutput>)
+```
+
+<ParamField path="schema" type="IValidationSchema<TOutput>" required>
+  Validation schema applied to the task's return value.
+  
+  ```typescript
+  .resultSchema<{ userId: string }>({
+    parse: (result) => {
+      if (!result.userId) {
+        throw new Error('Missing userId');
+      }
+      return result;
+    }
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with updated output type
+
+### run()
+
+Defines the task's execution logic.
+
+```typescript
+.run<TInput, TOutput>(
+  fn: (context: TaskContext<TInput, TDeps>) => Promise<TOutput>
+)
+```
+
+<ParamField path="fn" type="Function" required>
+  The task execution function. Receives a context object with:
+  - `input` - The validated task input
+  - `deps` - Resolved dependencies
+  - `runtime` - Runtime instance for running other tasks/emitting events
+  - `logger` - Scoped logger
+  - `journal` - Execution journal for middleware communication
+  
+  ```typescript
+  .run(async ({ input, deps, runtime, logger, journal }) => {
+    await logger.info('Starting task');
+    const data = await deps.database.query(input.id);
+    await runtime.emitEvent(dataFetched, { data });
+    return data;
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder (required before calling `build()`)
+
+### dependencies()
+
+Defines dependencies to inject into the task.
+
+```typescript
+.dependencies<TDeps>(
+  deps: TDeps | (() => TDeps),
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="deps" type="DependencyMap | () => DependencyMap" required>
+  Object mapping dependency keys to resources. Can be a static object or a function.
+  
+  ```typescript
+  .dependencies(() => ({
+    database: globals.resources.store,
+    emailService: myEmailService,
+  }))
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing dependencies. When `false` (default), merges with existing.
+</ParamField>
+
+**Returns:** New builder with updated dependencies type
+
+### middleware()
+
+Attaches middleware to the task.
+
+```typescript
+.middleware<TMiddleware>(
+  mw: TaskMiddlewareAttachment[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="mw" type="TaskMiddlewareAttachment[]" required>
+  Array of middleware attachments (middleware with configuration).
+  
+  ```typescript
+  .middleware([
+    globals.middleware.task.retry.with({ maxAttempts: 3 }),
+    globals.middleware.task.timeout.with({ ms: 5000 }),
+    customMiddleware.with({ /* config */ }),
+  ])
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing middleware. When `false` (default), appends to existing.
+</ParamField>
+
+**Returns:** New builder with middleware attached
+
+### tags()
+
+Attaches tags for grouping and filtering.
+
+```typescript
+.tags<TTags>(
+  tags: TagType[],
+  options?: { override?: boolean }
+)
+```
+
+<ParamField path="tags" type="TagType[]" required>
+  Array of tag definitions.
+  
+  ```typescript
+  const apiTag = r.tag('app.tags.api').build();
+  
+  .tags([apiTag, globals.tags.debug])
+  ```
+</ParamField>
+
+<ParamField path="options.override" type="boolean" default="false">
+  When `true`, replaces existing tags. When `false` (default), appends to existing.
+</ParamField>
+
+**Returns:** New builder with tags attached
+
+### meta()
+
+Attaches metadata for documentation and tooling.
+
+```typescript
+.meta<TMeta>(metadata: ITaskMeta)
+```
+
+<ParamField path="metadata" type="ITaskMeta" required>
+  Metadata object with optional `title` and `description`.
+  
+  ```typescript
+  .meta({
+    title: "Send Welcome Email",
+    description: "Sends a welcome email to newly registered users",
+  })
+  ```
+</ParamField>
+
+**Returns:** New builder with metadata attached
+
+### throws()
+
+Documents which errors the task may throw.
+
+```typescript
+.throws(errorList: ThrowsList)
+```
+
+<ParamField path="errorList" type="ThrowsList" required>
+  Array of error classes or error definitions.
+  
+  ```typescript
+  const ValidationError = r.error('app.errors.validation').build();
+  
+  .throws([ValidationError, DatabaseError])
+  ```
+</ParamField>
+
+**Returns:** New builder with error documentation
+
+### build()
+
+Builds and returns the final task definition.
+
+```typescript
+.build(): ITask<TInput, TOutput, TDeps, TMeta, TTags, TMiddleware>
+```
+
+**Returns:** Immutable task definition ready to register
+
+**Throws:** Error if `run()` was not called
+
+## Type Signature
+
+```typescript
+interface TaskFluentBuilder<
+  TInput = undefined,
+  TOutput extends Promise<any> = Promise<any>,
+  TDeps extends DependencyMapType = {},
+  TMeta extends ITaskMeta = ITaskMeta,
+  TTags extends TagType[] = TagType[],
+  TMiddleware extends TaskMiddlewareAttachmentType[] = TaskMiddlewareAttachmentType[]
+> {
+  id: string;
+  inputSchema<TNewInput>(schema: IValidationSchema<TNewInput>): TaskFluentBuilder<...>;
+  schema<TNewInput>(schema: IValidationSchema<TNewInput>): TaskFluentBuilder<...>;
+  resultSchema<TResolved>(schema: IValidationSchema<TResolved>): TaskFluentBuilder<...>;
+  run<TNewInput, TNewOutput>(fn: TaskRunFn<...>): TaskFluentBuilder<...>;
+  dependencies<TNewDeps>(deps: TNewDeps | (() => TNewDeps), options?: { override?: boolean }): TaskFluentBuilder<...>;
+  middleware<TNewMw>(mw: TNewMw, options?: { override?: boolean }): TaskFluentBuilder<...>;
+  tags<TNewTags>(tags: TNewTags, options?: { override?: boolean }): TaskFluentBuilder<...>;
+  meta<TNewMeta>(meta: TNewMeta): TaskFluentBuilder<...>;
+  throws(list: ThrowsList): TaskFluentBuilder<...>;
+  build(): ITask<TInput, TOutput, TDeps, TMeta, TTags, TMiddleware>;
+}
+```
+
+## Examples
+
+### Basic Task
+
+```typescript
+const hello = r.task("app.tasks.hello")
+  .run(async () => "Hello, World!")
+  .build();
+```
+
+### Task with Input
+
+```typescript
+const greet = r.task("app.tasks.greet")
+  .inputSchema<{ name: string }>({
+    parse: (v) => {
+      if (!v.name) throw new Error('Name required');
+      return v;
+    }
+  })
+  .run(async ({ input }) => `Hello, ${input.name}!`)
+  .build();
+```
+
+### Task with Dependencies
+
+```typescript
+const createUser = r.task("app.tasks.createUser")
+  .inputSchema<{ email: string; name: string }>({ parse: (v) => v })
+  .dependencies(() => ({
+    database: globals.resources.store,
+    logger: globals.resources.logger,
+  }))
+  .run(async ({ input, deps }) => {
+    await deps.logger.info(`Creating user: ${input.email}`);
+    const user = await deps.database.insert('users', input);
+    return user;
+  })
+  .build();
+```
+
+### Task with Middleware
+
+```typescript
+const fetchData = r.task("app.tasks.fetchData")
+  .middleware([
+    globals.middleware.task.retry.with({ maxAttempts: 3, delayMs: 1000 }),
+    globals.middleware.task.timeout.with({ ms: 5000 }),
+    globals.middleware.task.cache.with({ ttl: 60000 }),
+  ])
+  .run(async () => {
+    return await fetch('https://api.example.com/data');
+  })
+  .build();
+```
+
+### Task with Everything
+
+```typescript
+const processOrder = r.task("app.tasks.processOrder")
+  .inputSchema<{ orderId: string }>({
+    parse: (v) => {
+      if (!v.orderId) throw new Error('Order ID required');
+      return v;
+    }
+  })
+  .resultSchema<{ success: boolean; orderId: string }>({
+    parse: (v) => v
+  })
+  .dependencies(() => ({
+    database: databaseResource,
+    paymentService: paymentResource,
+    logger: globals.resources.logger,
+  }))
+  .middleware([
+    globals.middleware.task.retry.with({ maxAttempts: 3 }),
+    globals.middleware.task.timeout.with({ ms: 30000 }),
+  ])
+  .tags([apiTag, criticalTag])
+  .meta({
+    title: "Process Order",
+    description: "Processes a customer order including payment and fulfillment",
+  })
+  .throws([PaymentError, DatabaseError])
+  .run(async ({ input, deps, logger }) => {
+    await logger.info(`Processing order ${input.orderId}`);
+    
+    const order = await deps.database.getOrder(input.orderId);
+    await deps.paymentService.charge(order);
+    
+    return { success: true, orderId: input.orderId };
+  })
+  .build();
+```
+
+## Related
+
+- [r namespace](/api/r)
+- [Runtime - runTask()](/api/runtime/runtime#runtask)
+- [Middleware Builder](/api/builders/middleware)
+- [Task Guide](/concepts/tasks)

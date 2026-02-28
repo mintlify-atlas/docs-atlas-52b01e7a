@@ -1,0 +1,408 @@
+---
+title: GraphQL Exposure
+description: Runtime introspection and querying of tasks, resources, and events
+---
+
+<Warning>
+  **Node.js only** — GraphQL exposure via `nodeExposure` requires Node.js HTTP server capabilities.
+</Warning>
+
+GraphQL exposure provides runtime introspection and querying capabilities for your Runner application. It allows you to explore registered tasks, resources, events, and their metadata at runtime.
+
+## Overview
+
+The GraphQL exposure feature is built on top of `nodeExposure` and provides:
+
+- **Runtime introspection** — Query registered tasks, resources, events, and their configurations
+- **Type-safe schema** — Auto-generated GraphQL schema from your Runner definitions
+- **Authentication** — Same auth model as HTTP tunnels (token, validators, or anonymous)
+- **Discovery endpoint** — Enumerate available tasks and events for client-side routing
+
+<Note>
+  GraphQL exposure shares the same HTTP server and authentication model as HTTP tunnels. Both are powered by `nodeExposure`.
+</Note>
+
+## Quick Start
+
+### Enable GraphQL Exposure
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+import { nodeExposure } from "@bluelibs/runner/node";
+
+const app = r
+  .resource("app")
+  .register([
+    // Your tasks and resources
+    nodeExposure.with({
+      http: {
+        basePath: "/__runner",
+        listen: { port: 7070 },
+        auth: { token: "dev-secret" },
+      },
+    }),
+  ])
+  .build();
+
+const runtime = await run(app);
+```
+
+<Info>
+  The discovery endpoint is automatically available at `/__runner/discovery` when `nodeExposure` is configured.
+</Info>
+
+## Discovery Endpoint
+
+The discovery endpoint returns a list of tasks and events that are available for remote execution:
+
+### Request
+
+```bash
+curl -X POST http://localhost:7070/__runner/discovery \
+  -H "x-runner-token: dev-secret" \
+  -H "Content-Type: application/json"
+```
+
+### Response
+
+```json
+{
+  "ok": true,
+  "result": {
+    "allowList": {
+      "enabled": true,
+      "tasks": [
+        "app.tasks.add",
+        "app.tasks.upload",
+        "app.tasks.processOrder"
+      ],
+      "events": [
+        "app.events.notify",
+        "app.events.orderCreated"
+      ]
+    }
+  }
+}
+```
+
+## Querying Runtime Information
+
+You can use the discovery endpoint to build dynamic clients or tooling:
+
+```typescript
+import { createHttpClient } from "@bluelibs/runner";
+
+const client = createHttpClient({
+  baseUrl: "http://localhost:7070/__runner",
+  auth: { token: "dev-secret" },
+});
+
+// Query discovery
+const response = await fetch(
+  "http://localhost:7070/__runner/discovery",
+  {
+    method: "POST",
+    headers: {
+      "x-runner-token": "dev-secret",
+      "Content-Type": "application/json",
+    },
+  }
+);
+
+const { result } = await response.json();
+console.log("Available tasks:", result.allowList.tasks);
+console.log("Available events:", result.allowList.events);
+```
+
+## Disabling Discovery
+
+For security reasons, you may want to disable the discovery endpoint in production:
+
+```typescript
+nodeExposure.with({
+  http: {
+    basePath: "/__runner",
+    listen: { port: 7070 },
+    auth: { token: process.env.RUNNER_TOKEN },
+    disableDiscovery: true, // Disable discovery endpoint
+  },
+});
+```
+
+<Warning>
+  When `disableDiscovery: true`, requests to `/__runner/discovery` return `404 Not Found`.
+</Warning>
+
+## Authentication
+
+Discovery endpoint uses the same authentication as HTTP tunnels:
+
+### Static Token
+
+```typescript
+nodeExposure.with({
+  http: {
+    auth: {
+      token: "my-secret-token",
+    },
+  },
+});
+```
+
+### Multiple Tokens
+
+```typescript
+nodeExposure.with({
+  http: {
+    auth: {
+      token: ["key-v1", "key-v2"],
+    },
+  },
+});
+```
+
+### Dynamic Validation
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const authValidator = r
+  .task("app.tasks.auth.validate")
+  .tags([globals.tags.authValidator])
+  .run(async ({ headers }) => ({
+    ok: headers["x-tenant"] === "acme",
+  }))
+  .build();
+```
+
+## Use Cases
+
+### Dynamic Client Generation
+
+Use discovery to generate typed clients at runtime:
+
+```typescript
+const { result } = await fetch(
+  "http://localhost:7070/__runner/discovery",
+  {
+    method: "POST",
+    headers: {
+      "x-runner-token": "dev-secret",
+    },
+  }
+).then(r => r.json());
+
+// Generate client methods dynamically
+const client = {};
+for (const taskId of result.allowList.tasks) {
+  client[taskId] = (input) => 
+    httpClient.task(taskId, input);
+}
+
+// Now you can call: client["app.tasks.add"]({ a: 1, b: 2 })
+```
+
+### API Documentation
+
+Use discovery to generate API documentation:
+
+```typescript
+const { result } = await fetch(
+  "http://localhost:7070/__runner/discovery",
+  {
+    method: "POST",
+    headers: { "x-runner-token": "dev-secret" },
+  }
+).then(r => r.json());
+
+console.log("# Available Tasks");
+for (const taskId of result.allowList.tasks) {
+  console.log(`- ${taskId}`);
+}
+
+console.log("\n# Available Events");
+for (const eventId of result.allowList.events) {
+  console.log(`- ${eventId}`);
+}
+```
+
+### Health Checks
+
+Use discovery as a health check endpoint:
+
+```typescript
+const isHealthy = await fetch(
+  "http://localhost:7070/__runner/discovery",
+  {
+    method: "POST",
+    headers: { "x-runner-token": "dev-secret" },
+  }
+).then(r => r.ok);
+
+console.log("Server healthy:", isHealthy);
+```
+
+## Server-Side Introspection
+
+You can also introspect the runtime from within your application:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+import { nodeExposure } from "@bluelibs/runner/node";
+
+const app = r
+  .resource("app")
+  .register([
+    // tasks...
+    nodeExposure.with({ http: { /* ... */ } }),
+  ])
+  .build();
+
+const runtime = await run(app);
+
+// Get all registered tasks
+const tasks = runtime.store.listTaskIds();
+console.log("Registered tasks:", tasks);
+
+// Get all registered events
+const events = runtime.store.listEventIds();
+console.log("Registered events:", events);
+```
+
+## Allow-List Control
+
+The discovery endpoint respects the same allow-list as HTTP tunnels:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const httpTunnel = r
+  .resource("app.tunnels.http")
+  .tags([globals.tags.tunnel])
+  .init(async () => ({
+    transport: "http",
+    mode: "server",
+    tasks: ["app.tasks.add", "app.tasks.upload"], // Only these appear
+    events: ["app.events.notify"],
+  }))
+  .build();
+```
+
+<Note>
+  Only tasks and events listed in server-mode tunnel resources appear in the discovery response.
+</Note>
+
+## Fail-Closed Behavior
+
+<Warning>
+  If no server-mode tunnel is registered, discovery returns `403 Forbidden` (fail-closed), unless `dangerouslyAllowOpenExposure: true` is set.
+</Warning>
+
+```typescript
+nodeExposure.with({
+  http: {
+    // No tasks exposed — discovery returns 403
+  },
+});
+```
+
+To explicitly allow open exposure (not recommended):
+
+```typescript
+nodeExposure.with({
+  http: {
+    dangerouslyAllowOpenExposure: true, // All tasks exposed
+  },
+});
+```
+
+## Error Responses
+
+| HTTP | Code               | Description                         |
+| ---- | ------------------ | ----------------------------------- |
+| 401  | `UNAUTHORIZED`     | Invalid token or failed auth        |
+| 403  | `FORBIDDEN`        | Exposure not enabled or not allowed |
+| 404  | `NOT_FOUND`        | Discovery disabled                  |
+| 500  | `INTERNAL_ERROR`   | Server error                        |
+
+## Production Checklist
+
+<Steps>
+  <Step title="Secure authentication">
+    Use strong tokens or validator tasks for `http.auth`
+  </Step>
+  <Step title="Disable in production (optional)">
+    Set `disableDiscovery: true` to prevent endpoint enumeration
+  </Step>
+  <Step title="Rate limiting">
+    Enforce rate limiting at your edge/proxy for discovery endpoint
+  </Step>
+  <Step title="CORS configuration">
+    Configure CORS if accessed from browsers
+  </Step>
+  <Step title="Monitor access">
+    Log and monitor discovery endpoint access patterns
+  </Step>
+</Steps>
+
+## Complete Example
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+import { nodeExposure } from "@bluelibs/runner/node";
+
+const add = r
+  .task("app.tasks.add")
+  .run(async (input: { a: number; b: number }) => input.a + input.b)
+  .build();
+
+const httpTunnel = r
+  .resource("app.tunnels.http")
+  .tags([globals.tags.tunnel])
+  .init(async () => ({
+    transport: "http",
+    mode: "server",
+    tasks: [add.id],
+  }))
+  .build();
+
+const app = r
+  .resource("app")
+  .register([
+    add,
+    httpTunnel,
+    nodeExposure.with({
+      http: {
+        basePath: "/__runner",
+        listen: { port: 7070 },
+        auth: { token: "dev-secret" },
+        disableDiscovery: false, // Enable discovery
+      },
+    }),
+  ])
+  .build();
+
+const runtime = await run(app);
+
+// Query discovery
+const response = await fetch(
+  "http://localhost:7070/__runner/discovery",
+  {
+    method: "POST",
+    headers: {
+      "x-runner-token": "dev-secret",
+      "Content-Type": "application/json",
+    },
+  }
+);
+
+const { result } = await response.json();
+console.log("Exposed tasks:", result.allowList.tasks); // ["app.tasks.add"]
+
+await runtime.dispose();
+```
+
+## See Also
+
+- [HTTP Tunnels](/node/http-tunnels) — Remote task execution
+- [Durable Workflows](/node/durable-workflows) — Persistent workflows

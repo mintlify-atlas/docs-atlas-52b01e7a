@@ -1,0 +1,207 @@
+---
+title: "r (namespace)"
+description: "The unified fluent builder namespace for creating Runner components"
+---
+
+## Overview
+
+The `r` namespace provides a consistent, fluent API for building all Runner components. It's the primary way to define tasks, resources, events, hooks, and middleware in your application.
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+```
+
+## Methods
+
+### r.task()
+
+Creates a new task builder.
+
+```typescript
+const greet = r.task("app.tasks.greet")
+  .inputSchema<{ name: string }>({ parse: (v) => v })
+  .run(async (input) => `Hello, ${input.name}!`)
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the task (e.g., "app.tasks.greet")
+
+**Returns:** [TaskFluentBuilder](/api/builders/task)
+
+### r.resource()
+
+Creates a new resource builder.
+
+```typescript
+const database = r.resource("app.database")
+  .configSchema<{ connectionString: string }>({ parse: (v) => v })
+  .init(async ({ config }) => {
+    return await connectToDatabase(config.connectionString);
+  })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the resource (e.g., "app.database")
+
+**Returns:** [ResourceFluentBuilder](/api/builders/resource)
+
+### r.event()
+
+Creates a new event builder.
+
+```typescript
+const userRegistered = r.event("app.events.user.registered")
+  .payloadSchema<{ userId: string; email: string }>({ parse: (v) => v })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the event (e.g., "app.events.user.registered")
+
+**Returns:** [EventFluentBuilder](/api/builders/event)
+
+### r.hook()
+
+Creates a new hook (event listener) builder.
+
+```typescript
+const sendWelcomeEmail = r.hook("app.hooks.sendWelcome")
+  .on(userRegistered)
+  .dependencies(() => ({ emailService }))
+  .run(async ({ payload, deps }) => {
+    await deps.emailService.send(payload.email, "Welcome!");
+  })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the hook (e.g., "app.hooks.sendWelcome")
+
+**Returns:** [HookFluentBuilder](/api/builders/hook)
+
+### r.middleware.task()
+
+Creates a task middleware builder.
+
+```typescript
+const loggingMiddleware = r.middleware.task("app.middleware.logging")
+  .run(async ({ task, input, next }) => {
+    console.log(`Running task: ${task.id}`);
+    const result = await next();
+    console.log(`Task completed: ${task.id}`);
+    return result;
+  })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the middleware
+
+**Returns:** [TaskMiddlewareFluentBuilder](/api/builders/middleware#task-middleware)
+
+### r.middleware.resource()
+
+Creates a resource middleware builder.
+
+```typescript
+const metricsMiddleware = r.middleware.resource("app.middleware.metrics")
+  .run(async ({ resource, next }) => {
+    const start = Date.now();
+    const result = await next();
+    console.log(`${resource.id} initialized in ${Date.now() - start}ms`);
+    return result;
+  })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the middleware
+
+**Returns:** [ResourceMiddlewareFluentBuilder](/api/builders/middleware#resource-middleware)
+
+### r.tag()
+
+Creates a tag for grouping and filtering components.
+
+```typescript
+const apiTag = r.tag("app.tags.api")
+  .meta({ title: "API Tasks", description: "Tasks exposed via API" })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the tag
+
+**Returns:** Tag builder
+
+### r.override()
+
+Creates an override to modify existing components.
+
+```typescript
+const taskOverride = r.override()
+  .task(originalTask)
+  .middleware([customMiddleware])
+  .build();
+```
+
+**Returns:** Override builder
+
+### r.asyncContext()
+
+Creates an async context for storing execution-scoped data.
+
+```typescript
+const requestContext = r.asyncContext("app.context.request")
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the context
+
+**Returns:** Async context builder
+
+### r.error()
+
+Creates a typed error class.
+
+```typescript
+const ValidationError = r.error("app.errors.validation")
+  .meta({ title: "Validation Error" })
+  .build();
+```
+
+**Parameters:**
+- `id` (string): Unique identifier for the error
+
+**Returns:** Error builder
+
+## Type Information
+
+```typescript
+export const r: {
+  resource: (id: string) => ResourceFluentBuilder;
+  task: (id: string) => TaskFluentBuilder;
+  event: (id: string) => EventFluentBuilder;
+  hook: (id: string) => HookFluentBuilder;
+  tag: (id: string) => TagBuilder;
+  override: () => OverrideBuilder;
+  asyncContext: (id: string) => AsyncContextBuilder;
+  error: (id: string) => ErrorBuilder;
+  middleware: {
+    task: (id: string) => TaskMiddlewareFluentBuilder;
+    resource: (id: string) => ResourceMiddlewareFluentBuilder;
+  };
+};
+```
+
+## Related
+
+- [run()](/api/run) - Execute a resource and create a runtime
+- [Task Builder](/api/builders/task)
+- [Resource Builder](/api/builders/resource)
+- [Event Builder](/api/builders/event)
+- [Hook Builder](/api/builders/hook)
+- [Middleware Builders](/api/builders/middleware)

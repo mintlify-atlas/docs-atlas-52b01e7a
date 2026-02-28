@@ -1,0 +1,744 @@
+---
+title: Creating Custom Middleware
+description: Build your own middleware to add cross-cutting concerns tailored to your application
+---
+
+While Runner provides powerful built-in middleware, you'll often need custom middleware for application-specific concerns like authentication, logging, metrics, or business rules.
+
+## Anatomy of Middleware
+
+Middleware is a function that wraps task or resource execution:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const myMiddleware = r.middleware
+  .task("app.middleware.myMiddleware")
+  .run(async ({ task, next, journal }, deps, config) => {
+    // 1. Before: Run logic before the task
+    console.log(`Task ${task.definition.id} starting`);
+    
+    // 2. Execute: Call next() to run the task
+    const result = await next(task.input);
+    
+    // 3. After: Run logic after the task
+    console.log(`Task ${task.definition.id} completed`);
+    
+    // 4. Return: Must return the result
+    return result;
+  })
+  .build();
+```
+
+### Middleware Parameters
+
+<ParamField path="task" type="object">
+  The task being executed, including `definition` (metadata) and `input` (arguments)
+</ParamField>
+
+<ParamField path="next" type="function">
+  Function that executes the task. Call with `next(task.input)` to proceed.
+</ParamField>
+
+<ParamField path="journal" type="ExecutionJournal">
+  Type-safe registry for sharing state between middleware and tasks
+</ParamField>
+
+<ParamField path="deps" type="object">
+  Injected dependencies (resources or tasks) declared in `.dependencies()`
+</ParamField>
+
+<ParamField path="config" type="any">
+  Configuration passed via `.with()` when applying the middleware
+</ParamField>
+
+## Basic Middleware Patterns
+
+### Logging Middleware
+
+Log task execution with timing:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const loggingMiddleware = r.middleware
+  .task("app.middleware.logging")
+  .dependencies({ logger: globals.resources.logger })
+  .run(async ({ task, next }, { logger }) => {
+    const startTime = Date.now();
+    
+    await logger.info(`Task ${task.definition.id} started`, {
+      data: { input: task.input }
+    });
+    
+    try {
+      const result = await next(task.input);
+      const duration = Date.now() - startTime;
+      
+      await logger.info(`Task ${task.definition.id} completed`, {
+        data: { duration, success: true }
+      });
+      
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      await logger.error(`Task ${task.definition.id} failed`, {
+        error,
+        data: { duration, success: false }
+      });
+      
+      throw error;
+    }
+  })
+  .build();
+```
+
+### Authentication Middleware
+
+Verify user permissions before execution:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+type AuthConfig = { requiredRole: string };
+type AuthInput = { user: { role: string } };
+
+const authMiddleware = r.middleware
+  .task<AuthConfig, AuthInput>("app.middleware.auth")
+  .run(async ({ task, next }, deps, config) => {
+    const { user } = task.input;
+    
+    if (!user) {
+      throw new Error("Authentication required");
+    }
+    
+    if (user.role !== config.requiredRole) {
+      throw new Error(`Insufficient permissions. Required: ${config.requiredRole}`);
+    }
+    
+    return next(task.input);
+  })
+  .build();
+
+const adminTask = r
+  .task("admin.deleteUser")
+  .middleware([authMiddleware.with({ requiredRole: "admin" })])
+  .run(async (input: { user: { role: string }; userId: string }) => {
+    return deleteUser(input.userId);
+  })
+  .build();
+```
+
+### Validation Middleware
+
+Validate inputs before execution:
+
+```typescript
+import { r } from "@bluelibs/runner";
+import { z } from "zod";
+
+type ValidationConfig<T> = { schema: z.ZodSchema<T> };
+
+const validationMiddleware = r.middleware
+  .task("app.middleware.validation")
+  .run(async ({ task, next }, deps, config: ValidationConfig<any>) => {
+    // Validate input against schema
+    const parseResult = config.schema.safeParse(task.input);
+    
+    if (!parseResult.success) {
+      throw new Error(`Validation failed: ${parseResult.error.message}`);
+    }
+    
+    // Continue with validated input
+    return next(parseResult.data);
+  })
+  .build();
+
+const createUser = r
+  .task("users.create")
+  .middleware([
+    validationMiddleware.with({
+      schema: z.object({
+        name: z.string().min(1),
+        email: z.string().email(),
+      })
+    })
+  ])
+  .run(async (input: { name: string; email: string }) => {
+    return database.users.insert(input);
+  })
+  .build();
+```
+
+### Metrics Middleware
+
+Track task performance:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const metricsMiddleware = r.middleware
+  .task("app.middleware.metrics")
+  .run(async ({ task, next }) => {
+    const startTime = Date.now();
+    const taskId = String(task.definition.id);
+    
+    metrics.increment('task.execution', { task: taskId });
+    
+    try {
+      const result = await next(task.input);
+      const duration = Date.now() - startTime;
+      
+      metrics.histogram('task.duration', duration, { task: taskId });
+      metrics.increment('task.success', { task: taskId });
+      
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      
+      metrics.histogram('task.duration', duration, { task: taskId });
+      metrics.increment('task.failure', { task: taskId });
+      
+      throw error;
+    }
+  })
+  .build();
+```
+
+## Advanced Patterns
+
+### Middleware with Dependencies
+
+Inject resources or tasks:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const auditLog = r
+  .resource("app.resources.auditLog")
+  .init(async () => ({
+    log: async (message: string) => console.log(`[AUDIT] ${message}`)
+  }))
+  .build();
+
+const auditMiddleware = r.middleware
+  .task("app.middleware.audit")
+  .dependencies({ auditLog, logger: globals.resources.logger })
+  .run(async ({ task, next }, { auditLog, logger }) => {
+    await auditLog.log(`Task ${task.definition.id} executed`);
+    await logger.info("Audit log written");
+    
+    return next(task.input);
+  })
+  .build();
+```
+
+### Input/Output Transformation
+
+Modify inputs before execution and outputs after:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const transformMiddleware = r.middleware
+  .task("app.middleware.transform")
+  .run(async ({ task, next }) => {
+    // Transform input
+    const transformedInput = {
+      ...task.input,
+      timestamp: Date.now(),
+    };
+    
+    // Execute with transformed input
+    const result = await next(transformedInput);
+    
+    // Transform output
+    return {
+      data: result,
+      metadata: {
+        executedAt: new Date().toISOString(),
+      },
+    };
+  })
+  .build();
+```
+
+### Error Transformation
+
+Catch and transform errors:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const errorHandlerMiddleware = r.middleware
+  .task("app.middleware.errorHandler")
+  .run(async ({ task, next }) => {
+    try {
+      return await next(task.input);
+    } catch (error) {
+      // Transform database errors to user-friendly messages
+      if (error.code === 'ECONNREFUSED') {
+        throw new Error("Database is unavailable. Please try again later.");
+      }
+      
+      if (error.code === '23505') {
+        throw new Error("This record already exists.");
+      }
+      
+      // Rethrow other errors
+      throw error;
+    }
+  })
+  .build();
+```
+
+### Conditional Execution
+
+Skip execution based on conditions:
+
+```typescript
+import { r, journal } from "@bluelibs/runner";
+
+const featureToggleKey = journal.createKey<boolean>("feature.enabled");
+
+const featureToggleMiddleware = r.middleware
+  .task("app.middleware.featureToggle")
+  .run(async ({ task, next, journal }, deps, config: { featureName: string }) => {
+    const isEnabled = await checkFeatureToggle(config.featureName);
+    
+    if (!isEnabled) {
+      throw new Error(`Feature ${config.featureName} is disabled`);
+    }
+    
+    journal.set(featureToggleKey, true);
+    return next(task.input);
+  })
+  .build();
+```
+
+### Short-Circuit Middleware
+
+Return a result without calling `next()`:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const cachingMiddleware = r.middleware
+  .task("app.middleware.simpleCache")
+  .run(async ({ task, next }) => {
+    const cacheKey = JSON.stringify(task.input);
+    const cached = cache.get(cacheKey);
+    
+    // Short-circuit: return cached value without calling next()
+    if (cached) {
+      return cached;
+    }
+    
+    // Cache miss: execute task and store result
+    const result = await next(task.input);
+    cache.set(cacheKey, result);
+    return result;
+  })
+  .build();
+```
+
+## Using the Execution Journal
+
+Share state between middleware layers:
+
+```typescript
+import { r, journal } from "@bluelibs/runner";
+
+// Define typed keys
+const traceIdKey = journal.createKey<string>("trace.id");
+const userIdKey = journal.createKey<string>("user.id");
+
+const traceMiddleware = r.middleware
+  .task("app.middleware.trace")
+  .run(async ({ task, next, journal }) => {
+    const traceId = `trace-${Date.now()}`;
+    journal.set(traceIdKey, traceId);
+    
+    console.log(`[${traceId}] Task started`);
+    const result = await next(task.input);
+    console.log(`[${traceId}] Task completed`);
+    
+    return result;
+  })
+  .build();
+
+const authMiddleware = r.middleware
+  .task("app.middleware.authWithTrace")
+  .run(async ({ task, next, journal }) => {
+    // Read trace ID set by previous middleware
+    const traceId = journal.get(traceIdKey);
+    
+    const userId = task.input.user?.id;
+    journal.set(userIdKey, userId);
+    
+    console.log(`[${traceId}] Authenticated as user ${userId}`);
+    
+    return next(task.input);
+  })
+  .build();
+
+const myTask = r
+  .task("app.tasks.example")
+  .middleware([traceMiddleware, authMiddleware])
+  .run(async (input, deps, { journal }) => {
+    const traceId = journal.get(traceIdKey);
+    const userId = journal.get(userIdKey);
+    
+    console.log(`[${traceId}] Processing for user ${userId}`);
+    return { success: true };
+  })
+  .build();
+```
+
+## Resource Middleware
+
+Middleware can also wrap resource initialization:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const resourceTimingMiddleware = r.middleware
+  .resource("app.middleware.resourceTiming")
+  .run(async ({ resource, next }) => {
+    console.log(`Initializing ${resource.definition.id}`);
+    const startTime = Date.now();
+    
+    try {
+      const value = await next(resource.config);
+      const duration = Date.now() - startTime;
+      
+      console.log(`Initialized ${resource.definition.id} in ${duration}ms`);
+      return value;
+    } catch (error) {
+      console.error(`Failed to initialize ${resource.definition.id}`, error);
+      throw error;
+    }
+  })
+  .build();
+
+const database = r
+  .resource("app.db")
+  .middleware([resourceTimingMiddleware])
+  .init(async () => {
+    const client = new MongoClient(process.env.DATABASE_URL);
+    await client.connect();
+    return client;
+  })
+  .build();
+```
+
+## Global Middleware
+
+Apply middleware to all tasks automatically:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const globalLoggingMiddleware = r.middleware
+  .task("app.middleware.globalLogging")
+  .everywhere(() => true) // Apply to all tasks
+  .dependencies({ logger: globals.resources.logger })
+  .run(async ({ task, next }, { logger }) => {
+    await logger.info(`Global: ${task.definition.id} started`);
+    const result = await next(task.input);
+    await logger.info(`Global: ${task.definition.id} completed`);
+    return result;
+  })
+  .build();
+
+const app = r
+  .resource("app")
+  .register([globalLoggingMiddleware]) // Applies to all tasks
+  .build();
+```
+
+<Note>
+Global middleware can depend on resources or tasks. Any such dependencies are excluded from the middleware's execution to prevent infinite loops.
+</Note>
+
+### Selective Global Middleware
+
+Apply middleware to tasks matching a condition:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const apiLoggingMiddleware = r.middleware
+  .task("app.middleware.apiLogging")
+  .everywhere((task) => String(task.id).startsWith("api.")) // Only API tasks
+  .dependencies({ logger: globals.resources.logger })
+  .run(async ({ task, next }, { logger }) => {
+    await logger.info(`API call: ${task.definition.id}`);
+    return next(task.input);
+  })
+  .build();
+```
+
+## Common Middleware Patterns
+
+### Fallback Middleware
+
+Provide default values on failure:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const fallbackMiddleware = r.middleware
+  .task("app.middleware.fallback")
+  .run(async ({ task, next }, deps, config: { defaultValue: any }) => {
+    try {
+      return await next(task.input);
+    } catch (error) {
+      console.warn(`Task failed, returning fallback`, error);
+      return config.defaultValue;
+    }
+  })
+  .build();
+
+const fetchData = r
+  .task("api.fetchData")
+  .middleware([
+    fallbackMiddleware.with({ defaultValue: { cached: true, data: [] } })
+  ])
+  .run(async (url: string) => fetch(url).then(r => r.json()))
+  .build();
+```
+
+### Concurrency Middleware
+
+Limit parallel executions:
+
+```typescript
+import { r } from "@bluelibs/runner";
+import { Semaphore } from "@bluelibs/runner/models/Semaphore";
+
+const concurrencyMiddleware = r.middleware
+  .task("app.middleware.concurrency")
+  .run(async ({ task, next }, deps, config: { limit: number }) => {
+    const semaphore = new Semaphore(config.limit);
+    return semaphore.withPermit(() => next(task.input));
+  })
+  .build();
+
+const expensiveTask = r
+  .task("tasks.expensive")
+  .middleware([
+    concurrencyMiddleware.with({ limit: 5 }) // Max 5 concurrent executions
+  ])
+  .run(async (input) => heavyComputation(input))
+  .build();
+```
+
+<Note>
+Consider using the built-in `globals.middleware.task.concurrency` instead of rolling your own.
+</Note>
+
+### Debounce Middleware
+
+Prevent rapid repeated executions:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const debounceState = new Map<string, { timer: NodeJS.Timeout; lastCall: number }>();
+
+const debounceMiddleware = r.middleware
+  .task("app.middleware.debounce")
+  .run(async ({ task, next }, deps, config: { delayMs: number }) => {
+    const key = String(task.definition.id);
+    const state = debounceState.get(key);
+    
+    if (state) {
+      clearTimeout(state.timer);
+    }
+    
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(async () => {
+        try {
+          const result = await next(task.input);
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      }, config.delayMs);
+      
+      debounceState.set(key, { timer, lastCall: Date.now() });
+    });
+  })
+  .build();
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always call next() unless short-circuiting">
+    Forgetting to call `next()` means the task never runs:
+    ```typescript
+    // Bad: task never executes
+    .run(async ({ task }) => {
+      console.log("Before");
+      // Missing: return next(task.input);
+    })
+    
+    // Good: task executes
+    .run(async ({ task, next }) => {
+      console.log("Before");
+      return next(task.input);
+    })
+    ```
+  </Accordion>
+
+  <Accordion title="Always return the result">
+    Middleware must return a value:
+    ```typescript
+    // Bad: result is lost
+    .run(async ({ task, next }) => {
+      await next(task.input);
+      // Missing return!
+    })
+    
+    // Good: result is propagated
+    .run(async ({ task, next }) => {
+      return next(task.input);
+    })
+    ```
+  </Accordion>
+
+  <Accordion title="Use the journal for cross-middleware communication">
+    Export journal keys for coordination:
+    ```typescript
+    // middleware.ts
+    export const journalKeys = {
+      userId: journal.createKey<string>("auth.userId"),
+    };
+    
+    // otherMiddleware.ts
+    import { journalKeys } from "./middleware";
+    const userId = journal.get(journalKeys.userId);
+    ```
+  </Accordion>
+
+  <Accordion title="Keep middleware focused and composable">
+    Do one thing well, combine multiple middleware:
+    ```typescript
+    .middleware([
+      authMiddleware,
+      loggingMiddleware,
+      metricsMiddleware,
+    ])
+    ```
+  </Accordion>
+
+  <Accordion title="Handle errors gracefully">
+    Decide whether to catch, transform, or rethrow:
+    ```typescript
+    try {
+      return await next(task.input);
+    } catch (error) {
+      logger.error("Task failed", error);
+      throw error; // Rethrow after logging
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+## Testing Middleware
+
+### Unit Testing
+
+Test middleware in isolation:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+const loggingMiddleware = r.middleware
+  .task("app.middleware.logging")
+  .run(async ({ task, next }) => {
+    console.log(`Starting ${task.definition.id}`);
+    const result = await next(task.input);
+    console.log(`Completed ${task.definition.id}`);
+    return result;
+  })
+  .build();
+
+test("logging middleware logs task execution", async () => {
+  const mockTask = {
+    definition: { id: "test.task" },
+    input: { value: 42 },
+  };
+  
+  const mockNext = jest.fn(async (input) => input.value * 2);
+  const mockJournal = { get: jest.fn(), set: jest.fn(), has: jest.fn() };
+  
+  // Call middleware directly
+  const result = await loggingMiddleware.definition.run(
+    { task: mockTask, next: mockNext, journal: mockJournal },
+    {},
+    {}
+  );
+  
+  expect(result).toBe(84);
+  expect(mockNext).toHaveBeenCalledWith({ value: 42 });
+});
+```
+
+### Integration Testing
+
+Test middleware with real tasks:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+const authMiddleware = r.middleware
+  .task("app.middleware.auth")
+  .run(async ({ task, next }, deps, config: { requiredRole: string }) => {
+    if (task.input.user?.role !== config.requiredRole) {
+      throw new Error("Unauthorized");
+    }
+    return next(task.input);
+  })
+  .build();
+
+const protectedTask = r
+  .task("tasks.protected")
+  .middleware([authMiddleware.with({ requiredRole: "admin" })])
+  .run(async (input: { user: { role: string } }) => ({ success: true }))
+  .build();
+
+test("auth middleware blocks unauthorized users", async () => {
+  const app = r.resource("app").register([protectedTask]).build();
+  const { runTask, dispose } = await run(app);
+  
+  await expect(
+    runTask(protectedTask, { user: { role: "user" } })
+  ).rejects.toThrow("Unauthorized");
+  
+  const result = await runTask(protectedTask, { user: { role: "admin" } });
+  expect(result).toEqual({ success: true });
+  
+  await dispose();
+});
+```
+
+## See Also
+
+<CardGroup cols={2}>
+  <Card title="Middleware Overview" icon="layer-group" href="/middleware/overview">
+    Understanding the middleware system
+  </Card>
+  <Card title="Retry Middleware" icon="rotate-right" href="/middleware/retry">
+    Example of built-in middleware
+  </Card>
+  <Card title="Execution Journal" icon="book" href="/core/execution-journal">
+    Share state between middleware
+  </Card>
+  <Card title="Global Middleware" icon="globe" href="/middleware/overview#global-middleware">
+    Apply middleware to all tasks
+  </Card>
+</CardGroup>

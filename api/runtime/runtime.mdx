@@ -1,0 +1,516 @@
+---
+title: "Runtime API (RunResult)"
+description: "Working with the runtime instance returned by run()"
+---
+
+## Overview
+
+The `RunResult` (also typed as `IRuntime`) is the runtime instance returned by `run()`. It provides access to task execution, event emission, resource access, and lifecycle management.
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+const app = r.resource("app")
+  .register([myTask, myResource])
+  .build();
+
+const runtime = await run(app);
+
+// Execute tasks
+const result = await runtime.runTask(myTask, input);
+
+// Emit events
+await runtime.emitEvent(myEvent, payload);
+
+// Access resources
+const value = runtime.getResourceValue(myResource);
+
+// Cleanup
+await runtime.dispose();
+```
+
+## Properties
+
+### value
+
+The initialized value of the root resource.
+
+```typescript
+runtime.value: V
+```
+
+```typescript
+const app = r.resource("app")
+  .init(async () => ({ version: "1.0.0", name: "MyApp" }))
+  .build();
+
+const runtime = await run(app);
+console.log(runtime.value); // { version: "1.0.0", name: "MyApp" }
+```
+
+### logger
+
+Framework logger for diagnostics and debugging.
+
+```typescript
+runtime.logger: Logger
+```
+
+```typescript
+await runtime.logger.info("Application started");
+await runtime.logger.error("Error occurred", { context: "details" });
+```
+
+### store
+
+Central store containing all registered tasks, events, resources, and metadata.
+
+```typescript
+runtime.store: Store
+```
+
+```typescript
+// Access registered tasks
+const allTasks = Array.from(runtime.store.tasks.values());
+
+// Access registered events
+const allEvents = Array.from(runtime.store.events.values());
+```
+
+## Methods
+
+### runTask()
+
+Executes a registered task within the runtime context.
+
+```typescript
+runtime.runTask<TTask extends ITask | string>(
+  task: TTask,
+  ...args: TTask extends ITask<infer I, any, any>
+    ? I extends undefined | void
+      ? [input?: I, options?: TaskCallOptions]
+      : [input: I, options?: TaskCallOptions]
+    : [input?: unknown, options?: TaskCallOptions]
+): Promise<TOutput>
+```
+
+<ParamField path="task" type="ITask | string" required>
+  The task to execute. Can be a task definition or task ID string.
+  
+  ```typescript
+  // With task definition
+  await runtime.runTask(greetTask, { name: "Alice" });
+  
+  // With task ID string
+  await runtime.runTask("app.tasks.greet", { name: "Bob" });
+  ```
+</ParamField>
+
+<ParamField path="input" type="TInput">
+  The task input. Optional if task has no input or void input.
+  
+  ```typescript
+  // Task with input
+  await runtime.runTask(createUser, { email: "user@example.com", name: "Alice" });
+  
+  // Task without input
+  await runtime.runTask(healthCheck);
+  ```
+</ParamField>
+
+<ParamField path="options" type="TaskCallOptions">
+  Optional execution options:
+  - `journal` - Execution journal for middleware communication
+  
+  ```typescript
+  const journal = journal.create();
+  await runtime.runTask(myTask, input, { journal });
+  ```
+</ParamField>
+
+<ResponseField name="result" type="TOutput">
+  The task's return value (unwrapped from Promise).
+</ResponseField>
+
+**Example:**
+
+```typescript
+const greeting = await runtime.runTask(greetTask, { name: "World" });
+console.log(greeting); // "Hello, World!"
+```
+
+**Throws:** `RuntimeError` if task not found or runtime disposed
+
+### emitEvent()
+
+Emits an event to trigger all registered hooks listening for it.
+
+```typescript
+runtime.emitEvent<P>(
+  event: IEvent<P> | string,
+  payload?: P extends undefined | void ? undefined : P,
+  options?: IEventEmitOptions
+): Promise<void | IEventEmitReport>
+```
+
+<ParamField path="event" type="IEvent | string" required>
+  The event to emit. Can be an event definition or event ID string.
+  
+  ```typescript
+  // With event definition
+  await runtime.emitEvent(userRegistered, { userId: "123", email: "user@example.com" });
+  
+  // With event ID string
+  await runtime.emitEvent("app.events.user.registered", { userId: "123", email: "user@example.com" });
+  ```
+</ParamField>
+
+<ParamField path="payload" type="TPayload">
+  The event payload. Optional if event has no payload or void payload.
+</ParamField>
+
+<ParamField path="options" type="IEventEmitOptions">
+  Optional emission options:
+  
+  <Expandable title="IEventEmitOptions properties">
+    <ParamField path="report" type="boolean" default="false">
+      When `true`, returns detailed emission report instead of void.
+    </ParamField>
+    
+    <ParamField path="failureMode" type="'continue' | 'stop'" default="continue">
+      How to handle hook failures:
+      - `continue`: Continue executing remaining hooks
+      - `stop`: Stop on first failure
+    </ParamField>
+    
+    <ParamField path="throwOnError" type="boolean" default="false">
+      Whether to throw if any hook fails.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+<ResponseField name="result" type="void | IEventEmitReport">
+  Returns `void` by default, or `IEventEmitReport` if `report: true`.
+  
+  The report contains:
+  - `successfulListeners` - Hooks that executed successfully
+  - `failedListeners` - Hooks that threw errors
+  - `skippedListeners` - Hooks that were skipped
+</ResponseField>
+
+**Examples:**
+
+```typescript
+// Basic emission
+await runtime.emitEvent(userRegistered, { userId: "123", email: "user@example.com" });
+
+// With report
+const report = await runtime.emitEvent(dataUpdated, { id: "123" }, { report: true });
+if (report.failedListeners.length > 0) {
+  console.error("Failed hooks:", report.failedListeners);
+}
+
+// Stop on first failure
+await runtime.emitEvent(criticalEvent, undefined, {
+  failureMode: 'stop',
+  throwOnError: true,
+});
+```
+
+**Throws:** `RuntimeError` if event not found or runtime disposed
+
+### getResourceValue()
+
+Synchronously retrieves the initialized value of a resource.
+
+```typescript
+runtime.getResourceValue<Output extends Promise<any>>(
+  resource: string | IResource<any, Output, any, any, any>
+): Output extends Promise<infer U> ? U : Output
+```
+
+<ParamField path="resource" type="IResource | string" required>
+  The resource to retrieve. Can be a resource definition or resource ID string.
+  
+  ```typescript
+  // With resource definition
+  const db = runtime.getResourceValue(databaseResource);
+  
+  // With resource ID string
+  const db = runtime.getResourceValue("app.database");
+  ```
+</ParamField>
+
+<ResponseField name="value" type="TValue">
+  The initialized resource value (unwrapped from Promise).
+</ResponseField>
+
+**Example:**
+
+```typescript
+const database = r.resource("app.database")
+  .init(async () => await connectToDatabase())
+  .build();
+
+const runtime = await run(app);
+const db = runtime.getResourceValue(database);
+await db.query('SELECT * FROM users');
+```
+
+**Throws:**
+- `RuntimeError` if resource not found, not initialized, or runtime disposed
+- `RuntimeError` if lazy mode is enabled and resource wasn't initialized (use `getLazyResourceValue()` instead)
+
+### getLazyResourceValue()
+
+Initializes (if not already) and returns the value of a resource on-demand.
+
+```typescript
+runtime.getLazyResourceValue<Output extends Promise<any>>(
+  resource: string | IResource<any, Output, any, any, any>
+): Promise<Output extends Promise<infer U> ? U : Output>
+```
+
+<ParamField path="resource" type="IResource | string" required>
+  The resource to retrieve.
+</ParamField>
+
+<ResponseField name="value" type="Promise<TValue>">
+  Promise resolving to the initialized resource value.
+</ResponseField>
+
+**Example:**
+
+```typescript
+const runtime = await run(app, { lazy: true });
+
+// Lazy-load resource on demand
+const heavyService = await runtime.getLazyResourceValue(heavyServiceResource);
+await heavyService.doWork();
+```
+
+**Throws:**
+- `RuntimeError` if resource not found or runtime disposed
+- `RuntimeError` if lazy mode is not enabled
+
+### getResourceConfig()
+
+Retrieves the configuration that was passed to a resource.
+
+```typescript
+runtime.getResourceConfig<Config>(
+  resource: string | IResource<Config, any, any, any, any>
+): Config
+```
+
+<ParamField path="resource" type="IResource | string" required>
+  The resource to retrieve config from.
+</ParamField>
+
+<ResponseField name="config" type="TConfig">
+  The config object passed when registering the resource.
+</ResponseField>
+
+**Example:**
+
+```typescript
+const server = r.resource("server")
+  .configSchema<{ port: number }>({ parse: (v) => v })
+  .build();
+
+const runtime = await run(server.with({ port: 3000 }));
+const config = runtime.getResourceConfig(server);
+console.log(config.port); // 3000
+```
+
+### getRootId()
+
+Returns the ID of the root resource.
+
+```typescript
+runtime.getRootId(): string
+```
+
+**Example:**
+
+```typescript
+const rootId = runtime.getRootId(); // "app"
+```
+
+### getRootConfig()
+
+Returns the configuration passed to the root resource.
+
+```typescript
+runtime.getRootConfig<Config = unknown>(): Config
+```
+
+**Example:**
+
+```typescript
+const config = runtime.getRootConfig<AppConfig>();
+console.log(config.environment); // "production"
+```
+
+### getRootValue()
+
+Returns the initialized value of the root resource.
+
+```typescript
+runtime.getRootValue<Value = unknown>(): Value
+```
+
+**Example:**
+
+```typescript
+const app = runtime.getRootValue<App>();
+console.log(app.version); // "1.0.0"
+```
+
+**Throws:** `RuntimeError` if root hasn't been initialized yet
+
+### dispose()
+
+Disposes the runtime and all registered resources.
+
+```typescript
+runtime.dispose(): Promise<void>
+```
+
+Disposal executes in reverse initialization order:
+1. All resource `dispose()` methods are called
+2. Event listeners are cleared
+3. Async contexts are reset
+4. Process hooks are removed
+
+After disposal, any further operations will throw.
+
+**Example:**
+
+```typescript
+const runtime = await run(app);
+
+try {
+  // Do work
+  await runtime.runTask(myTask, input);
+} finally {
+  // Always cleanup
+  await runtime.dispose();
+}
+```
+
+**Safe to call multiple times:** Subsequent calls return immediately.
+
+**Throws:** `RuntimeError` if called during bootstrap phase
+
+## Type Information
+
+```typescript
+export interface IRuntime<V = unknown> {
+  // Properties
+  readonly value: V;
+  readonly logger: Logger;
+  readonly store: Store;
+  
+  // Task execution
+  runTask<TTask extends ITask | string>(
+    task: TTask,
+    ...args: /* typed based on task */
+  ): Promise<TOutput>;
+  
+  // Event emission
+  emitEvent<P>(
+    event: IEvent<P> | string,
+    payload?: P,
+    options?: IEventEmitOptions
+  ): Promise<void | IEventEmitReport>;
+  
+  // Resource access
+  getResourceValue<Output extends Promise<any>>(
+    resource: string | IResource<any, Output, any, any, any>
+  ): Output extends Promise<infer U> ? U : Output;
+  
+  getLazyResourceValue<Output extends Promise<any>>(
+    resource: string | IResource<any, Output, any, any, any>
+  ): Promise<Output extends Promise<infer U> ? U : Output>;
+  
+  getResourceConfig<Config>(
+    resource: string | IResource<Config, any, any, any, any>
+  ): Config;
+  
+  // Root access
+  getRootId(): string;
+  getRootConfig<Config = unknown>(): Config;
+  getRootValue<Value = V>(): Value;
+  
+  // Lifecycle
+  dispose(): Promise<void>;
+}
+```
+
+## Complete Example
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+// Define components
+const greetTask = r.task("app.tasks.greet")
+  .inputSchema<{ name: string }>({ parse: (v) => v })
+  .run(async ({ input }) => `Hello, ${input.name}!`)
+  .build();
+
+const userRegistered = r.event("app.events.user.registered")
+  .payloadSchema<{ email: string }>({ parse: (v) => v })
+  .build();
+
+const logHook = r.hook("app.hooks.log")
+  .on(userRegistered)
+  .run(async ({ payload, logger }) => {
+    await logger.info(`User registered: ${payload.email}`);
+  })
+  .build();
+
+const database = r.resource("app.database")
+  .init(async () => await connectToDatabase())
+  .dispose(async ({ value }) => await value.close())
+  .build();
+
+const app = r.resource("app")
+  .register([greetTask, userRegistered, logHook, database])
+  .init(async ({ logger }) => {
+    await logger.info("App initialized");
+    return { version: "1.0.0" };
+  })
+  .build();
+
+// Run application
+const runtime = await run(app);
+
+try {
+  // Execute tasks
+  const greeting = await runtime.runTask(greetTask, { name: "Alice" });
+  console.log(greeting); // "Hello, Alice!"
+  
+  // Emit events
+  await runtime.emitEvent(userRegistered, { email: "alice@example.com" });
+  
+  // Access resources
+  const db = runtime.getResourceValue(database);
+  await db.query('SELECT * FROM users');
+  
+  // Access root
+  console.log(runtime.value.version); // "1.0.0"
+  console.log(runtime.getRootId()); // "app"
+  
+} finally {
+  // Cleanup
+  await runtime.dispose();
+}
+```
+
+## Related
+
+- [run()](/api/run) - Creating a runtime instance
+- [Execution Context](/api/runtime/execution) - Journal and execution state
+- [Task Builder](/api/builders/task)
+- [Resource Builder](/api/builders/resource)

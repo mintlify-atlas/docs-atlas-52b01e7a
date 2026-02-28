@@ -1,0 +1,454 @@
+---
+title: Overrides
+description: Replace component implementations for testing and configuration
+---
+
+Overrides let you **swap component implementations** without changing the rest of your dependency graph. Use them to inject test doubles, feature flags, or environment-specific implementations—all while preserving the same dependency structure.
+
+## Why Overrides?
+
+Instead of modifying registered components or restructuring your app, overrides let you:
+
+- Replace production implementations with test mocks
+- Swap backends (in-memory cache → Redis) without changing tasks
+- Feature-flag entire subsystems (real payment → sandbox payment)
+- Override third-party dependencies for testing
+
+## Basic Usage
+
+Define a component, then override its implementation:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+// Production implementation
+const emailService = r
+  .resource("app.services.email")
+  .init(async () => ({
+    send: async (to: string, subject: string, body: string) => {
+      // Real SMTP send
+      await sendViaSMTP(to, subject, body);
+    },
+  }))
+  .build();
+
+// Test implementation
+const mockEmailService = r
+  .override(emailService)
+  .init(async () => ({
+    send: async (to: string, subject: string, body: string) => {
+      console.log(`Mock email to ${to}: ${subject}`);
+    },
+  }))
+  .build();
+
+// Apply override
+const app = r
+  .resource("app")
+  .register([emailService, sendEmailTask])
+  .overrides([mockEmailService]) // ← Replace emailService
+  .build();
+
+const { runTask } = await run(app);
+await runTask(sendEmailTask, { to: "user@example.com" });
+// Calls mockEmailService.send instead of real SMTP
+```
+
+## Override Syntax Options
+
+Runner provides three ways to create overrides:
+
+### 1. Fluent Builder (Recommended)
+
+```typescript
+const mockService = r
+  .override(realService)
+  .init(async () => ({ /* mock */ }))
+  .build();
+```
+
+### 2. Shorthand (One-Liner)
+
+```typescript
+const mockService = r.override(
+  realService,
+  async () => ({ /* mock */ })
+);
+```
+
+### 3. Helper Function (Classic API)
+
+```typescript
+import { override } from "@bluelibs/runner";
+
+const mockService = override(realService, {
+  init: async () => ({ /* mock */ }),
+});
+```
+
+All three produce identical runtime behavior.
+
+## Overriding Tasks
+
+```typescript
+const chargeCard = r
+  .task("payments.chargeCard")
+  .dependencies({ stripe })
+  .run(async (input, { stripe }) => {
+    return stripe.charges.create(input);
+  })
+  .build();
+
+// Test override that always succeeds
+const mockChargeCard = r
+  .override(chargeCard)
+  .run(async (input) => ({
+    id: "test-charge-123",
+    amount: input.amount,
+    status: "succeeded",
+  }))
+  .build();
+
+const testApp = r
+  .resource("app")
+  .register([chargeCard, orderTask])
+  .overrides([mockChargeCard])
+  .build();
+```
+
+## Overriding Resources
+
+```typescript
+const database = r
+  .resource("app.db")
+  .init(async () => connectToPostgres())
+  .dispose(async (conn) => conn.close())
+  .build();
+
+// In-memory test database
+const testDatabase = r
+  .override(database)
+  .init(async () => createInMemoryDb())
+  .dispose(async (db) => db.clear())
+  .build();
+
+const testApp = r
+  .resource("app")
+  .register([database, userService])
+  .overrides([testDatabase])
+  .build();
+```
+
+## Overriding Middleware
+
+```typescript
+const authMiddleware = r.middleware
+  .task("app.middleware.auth")
+  .run(async ({ next, task }) => {
+    // Real JWT validation
+    const user = await validateJWT(task.input.token);
+    return next({ ...task.input, user });
+  })
+  .build();
+
+// Test middleware that always passes
+const mockAuthMiddleware = r
+  .override(authMiddleware)
+  .run(async ({ next, task }) => {
+    return next({ ...task.input, user: { id: "test-user" } });
+  })
+  .build();
+
+const testApp = r
+  .resource("app")
+  .register([authMiddleware, protectedTask])
+  .overrides([mockAuthMiddleware])
+  .build();
+```
+
+## Overriding Hooks
+
+```typescript
+const sendWelcomeEmail = r
+  .hook("users.sendWelcome")
+  .on(userCreated)
+  .dependencies({ emailService })
+  .run(async (event, { emailService }) => {
+    await emailService.send(event.data.email, "Welcome!");
+  })
+  .build();
+
+// Test hook that just logs
+const mockSendWelcomeEmail = r
+  .override(sendWelcomeEmail)
+  .run(async (event) => {
+    console.log(`Would send email to ${event.data.email}`);
+  })
+  .build();
+
+const testApp = r
+  .resource("app")
+  .register([userCreated, sendWelcomeEmail, createUser])
+  .overrides([mockSendWelcomeEmail])
+  .build();
+```
+
+## Conditional Overrides
+
+Apply overrides based on environment:
+
+```typescript
+const realCache = r
+  .resource("app.cache")
+  .init(async () => createRedisCache())
+  .build();
+
+const memoryCache = r
+  .override(realCache)
+  .init(async () => createInMemoryCache())
+  .build();
+
+const app = r
+  .resource("app")
+  .register([realCache, myTask])
+  .overrides(process.env.NODE_ENV === "test" ? [memoryCache] : [])
+  .build();
+```
+
+## Multiple Overrides
+
+Apply multiple overrides at once:
+
+```typescript
+const testApp = r
+  .resource("app")
+  .register([...productionComponents])
+  .overrides([
+    mockDatabase,
+    mockEmailService,
+    mockPaymentService,
+    mockAuthMiddleware,
+  ])
+  .build();
+```
+
+## Testing Pattern
+
+Create test fixtures with overrides:
+
+```typescript
+import { describe, test, expect } from "vitest";
+
+function createTestApp(overrides: any[] = []) {
+  return r
+    .resource("app")
+    .register([...productionComponents])
+    .overrides([
+      mockDatabase,
+      mockEmailService,
+      ...overrides, // Additional test-specific overrides
+    ])
+    .build();
+}
+
+describe("User Registration", () => {
+  test("sends welcome email", async () => {
+    const emailsSent: string[] = [];
+    
+    const spyEmailService = r
+      .override(emailService)
+      .init(async () => ({
+        send: async (to: string) => {
+          emailsSent.push(to);
+        },
+      }))
+      .build();
+    
+    const testApp = createTestApp([spyEmailService]);
+    const { runTask, dispose } = await run(testApp);
+    
+    await runTask(registerUser, {
+      email: "ada@example.com",
+      name: "Ada",
+    });
+    
+    expect(emailsSent).toContain("ada@example.com");
+    await dispose();
+  });
+});
+```
+
+## Override Validation
+
+Overrides must match the original component's type signature:
+
+```typescript
+const getUser = r
+  .task("users.get")
+  .run(async (id: string): Promise<{ id: string; name: string }> => {
+    return { id, name: "Ada" };
+  })
+  .build();
+
+// ✅ Valid: same signature
+const mockGetUser = r
+  .override(getUser)
+  .run(async (id: string): Promise<{ id: string; name: string }> => {
+    return { id, name: "Mock User" };
+  })
+  .build();
+
+// ❌ Type error: signature mismatch
+const invalidOverride = r
+  .override(getUser)
+  // @ts-expect-error - return type doesn't match
+  .run(async (id: string): Promise<string> => {
+    return "invalid";
+  })
+  .build();
+```
+
+## Overrides vs. Mocks
+
+| Approach | When to Use |
+|----------|-------------|
+| **Overrides** | Replace entire implementations while preserving the dependency graph |
+| **Unit Test Mocks** | Pass mock dependencies directly to `.run()` for isolated tests |
+
+```typescript
+// Override: changes the whole app's behavior
+const testApp = r
+  .resource("app")
+  .register([realDb, myTask])
+  .overrides([mockDb])
+  .build();
+
+const { runTask } = await run(testApp);
+await runTask(myTask, input); // Uses mockDb
+
+// Mock: isolated unit test
+await myTask.run(input, { db: mockDbInstance });
+```
+
+## Nested Resource Overrides
+
+Override resources registered in sub-resources:
+
+```typescript
+const billingModule = r
+  .resource("billing")
+  .register([billingDb, billingService])
+  .build();
+
+const app = r
+  .resource("app")
+  .register([billingModule])
+  .overrides([mockBillingDb]) // ← Overrides billingDb even though it's nested
+  .build();
+```
+
+## Override Scope
+
+Overrides apply to the entire dependency graph from the registration point down:
+
+```typescript
+const moduleA = r
+  .resource("moduleA")
+  .register([realService, taskA])
+  .build();
+
+const moduleB = r
+  .resource("moduleB")
+  .register([realService, taskB])
+  .overrides([mockService]) // ← Only affects moduleB
+  .build();
+
+const app = r
+  .resource("app")
+  .register([moduleA, moduleB])
+  .build();
+
+// moduleA.taskA uses realService
+// moduleB.taskB uses mockService
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Keep Test Overrides Separate" icon="folder">
+    Create override definitions in test files, not production code
+  </Card>
+  
+  <Card title="Use Type Safety" icon="shield">
+    Let TypeScript catch signature mismatches between original and override
+  </Card>
+  
+  <Card title="Override at the Right Level" icon="layer-group">
+    Apply overrides in the resource that needs them, not globally
+  </Card>
+  
+  <Card title="Document Override Purpose" icon="book">
+    Use `.meta()` to explain why an override exists
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Spy Pattern
+
+```typescript
+const calls: any[] = [];
+
+const spyTask = r
+  .override(realTask)
+  .run(async (input) => {
+    calls.push(input);
+    return { spied: true };
+  })
+  .build();
+
+const { runTask } = await run(
+  r.resource("app")
+    .register([realTask])
+    .overrides([spyTask])
+    .build()
+);
+
+await runTask(realTask, { foo: "bar" });
+expect(calls).toEqual([{ foo: "bar" }]);
+```
+
+### Partial Override (Resource)
+
+```typescript
+const partialDbOverride = r
+  .override(database)
+  .init(async () => ({
+    ...await database.init(), // Keep some real methods
+    query: async (sql: string) => { /* mock query */ },
+  }))
+  .build();
+```
+
+### Environment-Specific Overrides
+
+```typescript
+const overrides = {
+  test: [mockDb, mockEmail, mockPayment],
+  development: [mockPayment],
+  production: [],
+};
+
+const app = r
+  .resource("app")
+  .register([...components])
+  .overrides(overrides[process.env.NODE_ENV as keyof typeof overrides])
+  .build();
+```
+
+## See Also
+
+- [Testing](/testing/overview) - Unit and integration test patterns
+- [Dependency Injection](/advanced/dependency-injection) - Understanding the dependency graph
+- [Resources](/concepts/resources) - Resource lifecycle and initialization
+- [Tasks](/concepts/tasks) - Task execution and mocking

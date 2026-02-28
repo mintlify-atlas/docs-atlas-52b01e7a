@@ -1,0 +1,333 @@
+---
+title: "Global Resources & Middleware"
+description: "Built-in global resources, events, and middleware provided by Runner"
+---
+
+## Overview
+
+Runner provides a set of global components that are automatically available in your application. These include core services, events, middleware, and utility resources.
+
+```typescript
+import { globals, run } from "@bluelibs/runner";
+```
+
+## Global Resources
+
+Access built-in resources via the `globals` namespace:
+
+```typescript
+const myTask = r.task("app.task")
+  .dependencies(() => ({
+    logger: globals.resources.logger,
+    store: globals.resources.store,
+  }))
+  .run(async ({ deps }) => {
+    await deps.logger.info("Task started");
+  })
+  .build();
+```
+
+### globals.resources
+
+<ResponseField name="store" type="IResource">
+  Central store containing all registered tasks, events, resources, and metadata.
+  
+  ```typescript
+  dependencies(() => ({ store: globals.resources.store }))
+  ```
+</ResponseField>
+
+<ResponseField name="logger" type="IResource">
+  Framework logger for diagnostics and debugging.
+  
+  ```typescript
+  .run(async ({ deps }) => {
+    await deps.logger.info("Message");
+    await deps.logger.error("Error", { context: "details" });
+  })
+  ```
+</ResponseField>
+
+<ResponseField name="runtime" type="IResource">
+  Access to the runtime instance (RunResult) from within tasks/resources.
+  
+  ```typescript
+  .run(async ({ deps }) => {
+    const value = deps.runtime.getResourceValue(someResource);
+    await deps.runtime.emitEvent(myEvent, payload);
+  })
+  ```
+</ResponseField>
+
+<ResponseField name="eventManager" type="IResource">
+  Event manager for emitting events and managing hooks.
+</ResponseField>
+
+<ResponseField name="taskRunner" type="IResource">
+  Task runner that executes tasks with middleware pipeline.
+</ResponseField>
+
+<ResponseField name="middlewareManager" type="IResource">
+  Manager for task and resource middleware.
+</ResponseField>
+
+<ResponseField name="serializer" type="IResource">
+  Serializer for converting objects to/from JSON (used in durable workflows).
+</ResponseField>
+
+<ResponseField name="cache" type="IResource">
+  Cache state resource (used by cache middleware).
+</ResponseField>
+
+<ResponseField name="queue" type="IResource">
+  Queue resource for managing task queues.
+</ResponseField>
+
+<ResponseField name="cron" type="IResource">
+  Cron scheduling resource for periodic tasks.
+</ResponseField>
+
+<ResponseField name="rateLimit" type="IResource">
+  Rate limiting state resource (used by rate limit middleware).
+</ResponseField>
+
+<ResponseField name="circuitBreaker" type="IResource">
+  Circuit breaker state resource (used by circuit breaker middleware).
+</ResponseField>
+
+<ResponseField name="temporal" type="IResource">
+  Temporal state resource for debounce/throttle middleware.
+</ResponseField>
+
+<ResponseField name="concurrency" type="IResource">
+  Concurrency control resource (used by concurrency middleware).
+</ResponseField>
+
+<ResponseField name="httpClientFactory" type="IResource">
+  Factory for creating HTTP clients.
+</ResponseField>
+
+<ResponseField name="debug" type="IResource">
+  Debug configuration resource.
+</ResponseField>
+
+## Global Events
+
+Access built-in events via `globals.events`:
+
+### globals.events.ready
+
+Emitted when the system is fully initialized and ready for work.
+
+```typescript
+const startupHook = r.hook("app.hooks.startup")
+  .on(globals.events.ready)
+  .run(async () => {
+    console.log("System is ready!");
+  })
+  .build();
+```
+
+**Payload:** `void`
+
+**When emitted:** Right before `run()` returns the runtime instance, after all resources have been initialized.
+
+## Global Middleware
+
+Runner provides built-in middleware for common patterns:
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+const myTask = r.task("app.task")
+  .middleware([
+    globals.middleware.task.retry.with({ maxAttempts: 3 }),
+    globals.middleware.task.timeout.with({ ms: 5000 }),
+  ])
+  .build();
+```
+
+### Task Middleware
+
+<ResponseField name="globals.middleware.task.retry" type="ITaskMiddleware">
+  Retry failed task executions.
+  
+  ```typescript
+  .middleware([globals.middleware.task.retry.with({ maxAttempts: 3, delayMs: 1000 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.timeout" type="ITaskMiddleware">
+  Abort task execution after a timeout.
+  
+  ```typescript
+  .middleware([globals.middleware.task.timeout.with({ ms: 5000 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.cache" type="ITaskMiddleware">
+  Cache task results based on input.
+  
+  ```typescript
+  .middleware([globals.middleware.task.cache.with({ ttl: 60000 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.circuitBreaker" type="ITaskMiddleware">
+  Prevent cascading failures with circuit breaker pattern.
+  
+  ```typescript
+  .middleware([globals.middleware.task.circuitBreaker.with({ 
+    failureThreshold: 5,
+    resetTimeoutMs: 30000 
+  })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.rateLimit" type="ITaskMiddleware">
+  Limit task execution rate.
+  
+  ```typescript
+  .middleware([globals.middleware.task.rateLimit.with({ 
+    maxCalls: 10,
+    windowMs: 60000 
+  })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.concurrency" type="ITaskMiddleware">
+  Limit concurrent task executions.
+  
+  ```typescript
+  .middleware([globals.middleware.task.concurrency.with({ maxConcurrent: 5 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.fallback" type="ITaskMiddleware">
+  Provide fallback logic on task failure.
+  
+  ```typescript
+  .middleware([globals.middleware.task.fallback.with({ 
+    fallback: async () => "default value" 
+  })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.debounce" type="ITaskMiddleware">
+  Debounce task execution.
+  
+  ```typescript
+  .middleware([globals.middleware.task.debounce.with({ delayMs: 500 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.throttle" type="ITaskMiddleware">
+  Throttle task execution.
+  
+  ```typescript
+  .middleware([globals.middleware.task.throttle.with({ intervalMs: 1000 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.task.requireContext" type="ITaskMiddleware">
+  Require an async context to be present.
+  
+  ```typescript
+  .middleware([globals.middleware.task.requireContext.with({ context: requestContext })])
+  ```
+</ResponseField>
+
+### Resource Middleware
+
+<ResponseField name="globals.middleware.resource.retry" type="IResourceMiddleware">
+  Retry failed resource initialization.
+  
+  ```typescript
+  .middleware([globals.middleware.resource.retry.with({ maxAttempts: 3 })])
+  ```
+</ResponseField>
+
+<ResponseField name="globals.middleware.resource.timeout" type="IResourceMiddleware">
+  Abort resource initialization after a timeout.
+  
+  ```typescript
+  .middleware([globals.middleware.resource.timeout.with({ ms: 10000 })])
+  ```
+</ResponseField>
+
+## Global Tags
+
+Access built-in tags via `globals.tags`:
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+const myTask = r.task("app.task")
+  .tags([globals.tags.debug])
+  .build();
+```
+
+## Tunnels
+
+Access tunnel functionality (Node.js only):
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+// Access tunnel resources
+globals.tunnels
+```
+
+## Debug
+
+Access debug utilities:
+
+```typescript
+import { globals } from "@bluelibs/runner";
+
+const runtime = await run(app, {
+  debug: globals.debug.simple(),
+});
+```
+
+## Type Information
+
+```typescript
+export const globals: {
+  events: {
+    ready: IEvent<void>;
+  };
+  resources: {
+    store: IResource;
+    logger: IResource;
+    runtime: IResource;
+    eventManager: IResource;
+    taskRunner: IResource;
+    middlewareManager: IResource;
+    serializer: IResource;
+    cache: IResource;
+    queue: IResource;
+    cron: IResource;
+    rateLimit: IResource;
+    circuitBreaker: IResource;
+    temporal: IResource;
+    concurrency: IResource;
+    httpClientFactory: IResource;
+    debug: IResource;
+  };
+  middleware: {
+    task: { /* task middleware */ };
+    resource: { /* resource middleware */ };
+  };
+  middlewares: typeof middleware; // Alias
+  tags: { /* built-in tags */ };
+  tunnels: { /* tunnel utilities */ };
+  debug: { /* debug utilities */ };
+};
+```
+
+## Related
+
+- [Middleware Guide](/middleware/overview)
+- [Events Guide](/concepts/events)
+- [Resources Guide](/concepts/resources)

@@ -1,0 +1,263 @@
+---
+title: Installation
+description: Set up BlueLibs Runner in your project
+---
+
+## Prerequisites
+
+Before installing Runner, ensure you have the following:
+
+| Requirement | Minimum | Notes |
+| --- | --- | --- |
+| Node.js | 18.x | Enforced by `package.json#engines.node` |
+| TypeScript | 5.6+ (recommended) | Required for typed DX and examples |
+| Package manager | npm / pnpm / yarn / bun | Any modern package manager works |
+| `fetch` runtime | Built-in or polyfilled | Required for tunnel clients |
+
+<Note>
+  If you use the Node-only package (`@bluelibs/runner/node`) for durable workflows or HTTP tunnel servers, stay on a supported Node LTS line.
+</Note>
+
+## Basic installation
+
+Install Runner using your preferred package manager:
+
+<CodeGroup>
+  ```bash npm
+  npm install @bluelibs/runner
+  ```
+
+  ```bash yarn
+  yarn add @bluelibs/runner
+  ```
+
+  ```bash pnpm
+  pnpm add @bluelibs/runner
+  ```
+
+  ```bash bun
+  bun add @bluelibs/runner
+  ```
+</CodeGroup>
+
+## Platform-specific installation
+
+Runner works across Node.js, browsers, and edge runtimes. Choose the import based on your platform:
+
+### Universal (Node, Browser, Edge)
+
+For code that runs anywhere:
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+```
+
+This import includes:
+- Core runtime (tasks, resources, middleware, events, hooks)
+- Reliability middleware (retry, timeout, cache, circuit breaker, rate limit)
+- HTTP tunnel clients (requires `fetch`)
+- Serialization utilities
+
+### Node.js only
+
+For Node-specific features like durable workflows and HTTP tunnel servers:
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+import { nodeExposure, durable } from "@bluelibs/runner/node";
+```
+
+The `/node` import includes:
+- **Async Context**: Per-request state using `AsyncLocalStorage`
+- **Durable Workflows**: Persistent, crash-recoverable async logic
+- **HTTP Tunnel Server**: Expose tasks and events over HTTP
+
+### Browser/Edge
+
+For browser or edge runtimes, use the standard import:
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+```
+
+<Warning>
+  Durable workflows and HTTP tunnel servers are **not available** in browser or edge runtimes. Only HTTP tunnel clients work in these environments.
+</Warning>
+
+## Optional dependencies
+
+Runner includes optional peer dependencies for specific features:
+
+### For durable workflows (Node only)
+
+```bash
+npm install ioredis
+```
+
+Used for persistent state storage in durable workflows.
+
+### For message queue integration (Node only)
+
+```bash
+npm install amqplib
+```
+
+Used for RabbitMQ integration in distributed systems.
+
+### For file uploads in HTTP tunnels (Node only)
+
+```bash
+npm install busboy
+```
+
+Used for multipart form data parsing in HTTP tunnel servers.
+
+<Note>
+  These dependencies are optional. Runner will work without them unless you use the specific features that require them.
+</Note>
+
+## Schema validation
+
+For runtime validation of inputs and outputs, install a schema library:
+
+<CodeGroup>
+  ```bash Zod (recommended)
+  npm install zod
+  ```
+
+  ```bash Custom validator
+  # Runner accepts any object with a parse(value) method
+  # You can use your own validation library
+  ```
+</CodeGroup>
+
+Runner works with any schema library that implements `{ parse: (value: unknown) => T }`. Zod is the most popular choice.
+
+## Verification
+
+Verify your installation by creating a simple test file:
+
+```typescript test.ts
+import { r, run } from "@bluelibs/runner";
+
+const greet = r
+  .task("greet")
+  .run(async (name: string) => `Hello, ${name}!`)
+  .build();
+
+const app = r.resource("app").register([greet]).build();
+
+const runtime = await run(app);
+const message = await runtime.runTask(greet, "World");
+console.log(message); // "Hello, World!"
+await runtime.dispose();
+```
+
+Run it:
+
+```bash
+npx tsx test.ts
+```
+
+You should see:
+
+```
+Hello, World!
+```
+
+<Tip>
+  If you see this output, Runner is installed correctly and ready to use!
+</Tip>
+
+## Development tools
+
+For enhanced development experience, install the Runner Dev CLI:
+
+```bash
+npm install -g @bluelibs/runner-dev
+```
+
+The CLI provides:
+- **Scaffolding**: Generate new Runner projects
+- **Introspection**: Query your app's structure via GraphQL
+- **Runtime inspection**: View running apps in a dev UI
+
+```bash
+# Scaffold a new project
+runner-dev new my-app --install
+
+# Query tasks from a TypeScript file
+runner-dev query 'query { tasks { id } }' --entry-file ./src/main.ts
+
+# Inspect a running app
+ENDPOINT=http://localhost:1337/graphql runner-dev overview --details 10
+```
+
+See the [Runner Dev Tools](https://github.com/bluelibs/runner-dev) repository for more details.
+
+## TypeScript configuration
+
+For the best experience, ensure your `tsconfig.json` includes:
+
+```json tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true
+  }
+}
+```
+
+<Note>
+  Runner is built with strict TypeScript and works best with `strict: true` enabled.
+</Note>
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Build your first Runner app in 5 minutes
+  </Card>
+  <Card title="Tasks" icon="code" href="/tasks">
+    Learn about business logic with DI
+  </Card>
+  <Card title="Resources" icon="database" href="/resources">
+    Manage singletons with lifecycle
+  </Card>
+  <Card title="Examples" icon="github" href="https://github.com/bluelibs/runner/tree/main/examples">
+    Explore real-world examples
+  </Card>
+</CardGroup>
+
+## Troubleshooting
+
+### Module resolution errors
+
+If you see errors like `Cannot find module '@bluelibs/runner'`, ensure:
+1. Runner is listed in your `package.json` dependencies
+2. You've run `npm install` (or your package manager equivalent)
+3. Your TypeScript configuration includes `moduleResolution: "node"`
+
+### Type errors with schemas
+
+If Zod schemas don't infer types correctly:
+1. Ensure you're using TypeScript 5.6+
+2. Check that `strict: true` is enabled in `tsconfig.json`
+3. Verify Zod is installed: `npm list zod`
+
+### Node-only features in browser
+
+If you see errors importing `/node` features in a browser:
+1. Use conditional imports based on your environment
+2. Ensure your bundler (Webpack, Vite, etc.) respects the `exports` field in `package.json`
+3. Check that you're not importing Node-only features in universal code
+
+<Tip>
+  Still having issues? Check the [GitHub Discussions](https://github.com/bluelibs/runner/discussions) or [open an issue](https://github.com/bluelibs/runner/issues).
+</Tip>

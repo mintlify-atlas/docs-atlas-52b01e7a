@@ -1,0 +1,540 @@
+---
+title: Mocking Dependencies
+description: Strategies for mocking resources, overriding dependencies, and using test doubles in Runner
+---
+
+Runner's explicit dependency injection makes mocking straightforward. You can mock dependencies at the task level for unit tests, or override entire resources for integration tests.
+
+## Unit Test Mocking
+
+Call `.run()` directly on tasks with mock dependencies. This bypasses the full runtime and middleware:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+// Define the real resource
+const emailService = r.resource("app.emailService")
+  .init(async () => ({
+    send: async (to: string, subject: string) => {
+      // Real email sending logic
+      await sendGridClient.send({ to, subject });
+    }
+  }))
+  .build();
+
+// Define task that depends on it
+const notifyUser = r.task("app.notifyUser")
+  .dependencies({ emailService })
+  .run(async (email: string, { emailService }) => {
+    await emailService.send(email, "Welcome!");
+    return { notified: true };
+  })
+  .build();
+
+// Unit test - provide mock directly
+it("sends notification email", async () => {
+  const mockEmailService = {
+    send: jest.fn().mockResolvedValue(undefined)
+  };
+  
+  const result = await notifyUser.run("user@example.com", {
+    emailService: mockEmailService
+  });
+  
+  expect(result.notified).toBe(true);
+  expect(mockEmailService.send).toHaveBeenCalledWith(
+    "user@example.com",
+    "Welcome!"
+  );
+});
+```
+
+**Key points:**
+- No runtime initialization needed
+- Bypasses middleware and validation
+- Fastest possible test execution
+- Perfect for testing business logic in isolation
+
+## Integration Test Overrides
+
+Use `override()` to replace resource implementations for integration tests:
+
+```typescript
+import { r, run, override } from "@bluelibs/runner";
+
+// Production resources
+const database = r.resource("app.db")
+  .init(async () => {
+    const client = new PostgresClient();
+    await client.connect();
+    return client;
+  })
+  .dispose(async (client) => client.disconnect())
+  .build();
+
+const emailService = r.resource("app.emailService")
+  .init(async () => ({
+    send: async (to: string, subject: string) => {
+      await sendGridClient.send({ to, subject });
+    }
+  }))
+  .build();
+
+// Production app
+const app = r.resource("app")
+  .register([database, emailService, /* tasks */])
+  .build();
+
+// Test overrides
+const testDb = override(database, {
+  init: async () => new InMemoryDatabase(),
+  dispose: async (db) => db.clear(),
+});
+
+const mockEmailService = override(emailService, {
+  init: async () => ({
+    send: jest.fn().mockResolvedValue(undefined)
+  })
+});
+
+// Create test app with overrides
+const testApp = r.resource("test.app")
+  .register([database, emailService, /* tasks */])
+  .overrides([testDb, mockEmailService])
+  .build();
+
+const { runTask, getResourceValue, dispose } = await run(testApp);
+
+try {
+  // Full pipeline runs with test doubles
+  await runTask(notifyUser, "user@example.com");
+  
+  const mailer = await getResourceValue(emailService);
+  expect(mailer.send).toHaveBeenCalled();
+} finally {
+  await dispose();
+}
+```
+
+## Override Patterns
+
+### Pattern: Spy on Real Implementation
+
+Wrap real logic with spies for observation:
+
+```typescript
+const database = r.resource("app.db")
+  .init(async () => ({
+    query: async (sql: string) => {
+      // Real query logic
+      return await executeQuery(sql);
+    }
+  }))
+  .build();
+
+const spyDb = override(database, {
+  init: async () => {
+    const querySpy = jest.fn();
+    return {
+      query: async (sql: string) => {
+        querySpy(sql);
+        return await executeQuery(sql); // Still executes real logic
+      },
+      querySpy, // Expose spy for assertions
+    };
+  }
+});
+```
+
+### Pattern: Conditional Behavior
+
+Create mocks that behave differently based on input:
+
+```typescript
+const mockEmailService = override(emailService, {
+  init: async () => ({
+    send: jest.fn().mockImplementation(async (to: string) => {
+      if (to.includes("@blocked.com")) {
+        throw new Error("Domain blocked");
+      }
+      return { messageId: "mock-123" };
+    })
+  })
+});
+
+// Test error handling
+it("handles blocked domains", async () => {
+  const testApp = r.resource("test.app")
+    .register([emailService, notifyUser])
+    .overrides([mockEmailService])
+    .build();
+  
+  const { runTask, dispose } = await run(testApp);
+  
+  try {
+    await expect(
+      runTask(notifyUser, "user@blocked.com")
+    ).rejects.toThrow("Domain blocked");
+  } finally {
+    await dispose();
+  }
+});
+```
+
+### Pattern: Stateful Mock
+
+Create mocks that maintain state across calls:
+
+```typescript
+const mockDatabase = override(database, {
+  init: async () => {
+    const users: User[] = [];
+    
+    return {
+      insert: async (user: User) => {
+        users.push(user);
+        return user;
+      },
+      findAll: async () => users,
+      findById: async (id: string) => 
+        users.find(u => u.id === id),
+      clear: () => users.length = 0,
+    };
+  }
+});
+
+it("persists users in mock db", async () => {
+  const { runTask, getResourceValue, dispose } = await run(testApp);
+  
+  try {
+    await runTask(createUser, { name: "Alice", email: "alice@test.com" });
+    await runTask(createUser, { name: "Bob", email: "bob@test.com" });
+    
+    const db = await getResourceValue(database);
+    const users = await db.findAll();
+    expect(users).toHaveLength(2);
+  } finally {
+    await dispose();
+  }
+});
+```
+
+## Testing Middleware
+
+Middleware doesn't run when calling `.run()` directly. Use full runtime to test middleware:
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+
+const expensiveTask = r.task("app.expensiveTask")
+  .middleware([
+    globals.middleware.task.cache.with({ ttl: 60000 })
+  ])
+  .run(async (input: number) => {
+    // Expensive computation
+    return input * 2;
+  })
+  .build();
+
+// Unit test - NO middleware
+it("computes correctly (no cache)", async () => {
+  const result = await expensiveTask.run(21, {});
+  expect(result).toBe(42);
+  // Cache middleware NOT executed
+});
+
+// Integration test - WITH middleware
+it("caches expensive computation", async () => {
+  const app = r.resource("app")
+    .register([expensiveTask])
+    .build();
+  
+  const { runTask, dispose } = await run(app);
+  
+  try {
+    // First call - cache miss
+    const result1 = await runTask(expensiveTask, 21);
+    expect(result1).toBe(42);
+    
+    // Second call - cache hit (faster)
+    const result2 = await runTask(expensiveTask, 21);
+    expect(result2).toBe(42);
+  } finally {
+    await dispose();
+  }
+});
+```
+
+## Mocking Events
+
+Mock event emitters to verify emissions:
+
+```typescript
+const userCreated = r.event("app.events.userCreated")
+  .payloadSchema(z.object({ userId: z.string() }))
+  .build();
+
+const createUser = r.task("app.createUser")
+  .dependencies({ database, userCreated })
+  .run(async (input: CreateUserInput, { database, userCreated }) => {
+    const user = await database.insert(input);
+    await userCreated({ userId: user.id });
+    return user;
+  })
+  .build();
+
+// Unit test - mock event emitter
+it("emits userCreated event", async () => {
+  const mockDatabase = {
+    insert: jest.fn().mockResolvedValue({ id: "123", name: "Alice" })
+  };
+  
+  const mockUserCreated = jest.fn();
+  
+  await createUser.run(
+    { name: "Alice", email: "alice@test.com" },
+    { database: mockDatabase, userCreated: mockUserCreated }
+  );
+  
+  expect(mockUserCreated).toHaveBeenCalledWith({ userId: "123" });
+});
+```
+
+## Testing Hooks
+
+Test that hooks react to events correctly:
+
+```typescript
+const userCreated = r.event("app.events.userCreated")
+  .payloadSchema(z.object({ userId: z.string() }))
+  .build();
+
+const sendWelcomeEmail = r.hook("app.hooks.sendWelcomeEmail")
+  .on(userCreated)
+  .dependencies({ emailService })
+  .run(async (event, { emailService }) => {
+    await emailService.send(
+      event.data.userId,
+      "Welcome to our platform!"
+    );
+  })
+  .build();
+
+it("sends welcome email when user created", async () => {
+  const mockEmailService = override(emailService, {
+    init: async () => ({
+      send: jest.fn().mockResolvedValue(undefined)
+    })
+  });
+  
+  const app = r.resource("app")
+    .register([userCreated, sendWelcomeEmail, emailService])
+    .overrides([mockEmailService])
+    .build();
+  
+  const { emitEvent, getResourceValue, dispose } = await run(app);
+  
+  try {
+    await emitEvent(userCreated, { userId: "user-123" });
+    
+    const mailer = await getResourceValue(emailService);
+    expect(mailer.send).toHaveBeenCalledWith(
+      "user-123",
+      "Welcome to our platform!"
+    );
+  } finally {
+    await dispose();
+  }
+});
+```
+
+## Test Doubles Reference
+
+### Jest Mocks
+
+```typescript
+const mockService = {
+  method: jest.fn().mockResolvedValue("result"),
+};
+
+// Assertions
+expect(mockService.method).toHaveBeenCalled();
+expect(mockService.method).toHaveBeenCalledWith("arg");
+expect(mockService.method).toHaveBeenCalledTimes(2);
+```
+
+### Spies
+
+```typescript
+const realService = {
+  method: async () => "real result"
+};
+
+const spy = jest.spyOn(realService, "method");
+
+// Use real service
+await realService.method();
+
+// Verify calls
+expect(spy).toHaveBeenCalled();
+```
+
+### Stubs
+
+```typescript
+const stubService = {
+  method: async () => "stubbed result", // Always returns this
+};
+```
+
+### Fakes
+
+```typescript
+class FakeDatabase {
+  private data = new Map();
+  
+  async insert(item: any) {
+    this.data.set(item.id, item);
+    return item;
+  }
+  
+  async findById(id: string) {
+    return this.data.get(id);
+  }
+  
+  clear() {
+    this.data.clear();
+  }
+}
+
+const fakeDb = override(database, {
+  init: async () => new FakeDatabase()
+});
+```
+
+## Real-World Examples
+
+From the Runner test suite:
+
+```typescript
+// From src/__tests__/run/run.overrides.test.ts
+it("overrides resource with mock implementation", async () => {
+  const task = r.task("task")
+    .run(async () => "Task executed")
+    .build();
+
+  const overrideTask = override(task, {
+    run: async () => "Task overridden",
+  });
+
+  const app = r.resource("app")
+    .register([task])
+    .dependencies({ task })
+    .overrides([overrideTask])
+    .init(async (_, deps) => {
+      return await deps.task();
+    })
+    .build();
+
+  const { value, dispose } = await run(app);
+  
+  try {
+    expect(value).toBe("Task overridden");
+  } finally {
+    await dispose();
+  }
+});
+```
+
+From the Fastify example:
+
+```typescript
+// From examples/fastify-mikroorm/src/users/tasks/direct-run.test.ts
+it("login sets cookie via context", async () => {
+  const testDb = override(database, {
+    init: async () => new InMemorySQLite()
+  });
+  
+  const testRunner = await run(
+    r.resource("test")
+      .register([httpRoute, db, users])
+      .overrides([testDb])
+      .build()
+  );
+  
+  try {
+    const { orm } = testRunner.getResourceValue(db);
+    await orm.getSchemaGenerator().createSchema();
+    
+    // Test with async context
+    await fastifyContext.provide(
+      { request: {} as any, reply: mockReply, userId: null },
+      async () => {
+        const result = await testRunner.runTask(loginUser, {
+          email: "test@example.com",
+          password: "password"
+        });
+        expect(result.token).toBeDefined();
+      }
+    );
+  } finally {
+    await testRunner.dispose();
+  }
+});
+```
+
+## Common Mistakes
+
+### ❌ Registering Both Base and Override
+
+```typescript
+// Wrong - duplicate ID error
+const app = r.resource("app")
+  .register([database, mockDatabase]) // Both registered!
+  .build();
+```
+
+### ✅ Use Overrides Correctly
+
+```typescript
+// Correct
+const mockDb = override(database, { /* mock impl */ });
+
+const app = r.resource("app")
+  .register([database])  // Register base
+  .overrides([mockDb])   // Override it
+  .build();
+```
+
+### ❌ Forgetting to Mock All Dependencies
+
+```typescript
+// Wrong - missing logger dependency
+await myTask.run(input, {
+  database: mockDb,
+  // logger is missing! Will throw
+});
+```
+
+### ✅ Mock All Dependencies
+
+```typescript
+// Correct
+await myTask.run(input, {
+  database: mockDb,
+  logger: { info: jest.fn(), error: jest.fn() },
+});
+```
+
+## Next Steps
+
+- **[Testing Overview](/testing/overview)** - Understand the testing philosophy and strategies
+- **[Test Resources](/testing/test-resources)** - Learn about test runtime utilities
+
+<Tip>
+**When to use which mocking strategy:**
+
+- **Unit tests**: Call `.run()` with plain mock objects
+- **Integration tests**: Use `override()` with `run()`
+- **E2E tests**: Use real resources with test configurations
+</Tip>

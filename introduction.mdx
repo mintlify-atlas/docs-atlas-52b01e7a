@@ -1,0 +1,130 @@
+---
+title: Introduction
+description: Build TypeScript apps from tasks and resources with explicit dependencies, predictable lifecycle, and first-class testing
+---
+
+<Note>
+  BlueLibs Runner is a TypeScript-first dependency injection toolkit for building applications from small, typed building blocks.
+</Note>
+
+## What is BlueLibs Runner?
+
+Runner is a dependency injection framework that helps you build maintainable TypeScript applications. Instead of wrestling with decorators or magic, you get explicit, testable code with powerful features built in.
+
+The goal is simple: keep dependencies explicit, keep lifecycle predictable, and make your runtime easy to control in production and in tests.
+
+## Key features
+
+<CardGroup cols={2}>
+  <Card title="Tasks" icon="code">
+    Async functions with explicit dependencies, middleware, and input/output validation using Zod or custom schemas
+  </Card>
+  <Card title="Resources" icon="database">
+    Singletons with `init`/`dispose` lifecycle for databases, clients, servers, and caches
+  </Card>
+  <Card title="Reliability middleware" icon="shield">
+    Built-in `retry`, `timeout`, `circuitBreaker`, `cache`, and `rateLimit` for production-grade resilience
+  </Card>
+  <Card title="HTTP tunnels" icon="network-wired">
+    Cross-process execution (the "Distributed Monolith") with zero call-site changes
+  </Card>
+  <Card title="Durable workflows" icon="rotate">
+    Persistent, crash-recoverable async logic for Node.js
+  </Card>
+  <Card title="Events & hooks" icon="bolt">
+    Typed signals and subscribers for decoupling components
+  </Card>
+  <Card title="Runtime control" icon="gauge">
+    Run, observe, test, and dispose your app predictably
+  </Card>
+  <Card title="Multi-platform" icon="globe">
+    Works in Node.js, browsers, and edge runtimes with platform adapters
+  </Card>
+</CardGroup>
+
+## Quick example
+
+Here's what Runner looks like in action:
+
+```typescript
+import { r, run, globals } from "@bluelibs/runner";
+import { z } from "zod";
+
+// Resources are singletons with lifecycle management and async construction
+const db = r
+  .resource("app.db")
+  .init(async () => {
+    const conn = await postgres.connect(process.env.DB_URL);
+    return conn;
+  })
+  .build();
+
+const mailer = r
+  .resource("app.mailer")
+  .init(async () => ({
+    sendWelcome: async (email: string) => {
+      console.log(`Sending welcome email to ${email}`);
+    },
+  }))
+  .build();
+
+// Define a task with dependencies, middleware, and zod validation
+const createUser = r
+  .task("users.create")
+  .dependencies({ db, mailer })
+  .middleware([globals.middleware.task.retry.with({ retries: 3 })])
+  .inputSchema(z.object({ name: z.string(), email: z.string().email() }))
+  .run(async (input, { db, mailer }) => {
+    const user = await db.users.insert(input);
+    await mailer.sendWelcome(user.email);
+    return user;
+  })
+  .build();
+
+// Compose resources and run your application
+const app = r
+  .resource("app") // top-level app resource
+  .register([db, mailer, createUser]) // register all elements
+  .build();
+
+const runtime = await run(app);
+await runtime.runTask(createUser, { name: "Ada", email: "ada@example.com" });
+// await runtime.dispose() when you are done.
+```
+
+## Why Runner?
+
+**Explicit over magic**: No decorators, no reflection, no hidden wiring. You see exactly what depends on what.
+
+**Production-ready**: Built-in middleware for retry, timeout, circuit breakers, rate limiting, and caching. No need to build these yourself.
+
+**Test-friendly**: Every component is isolated and composable. Override any dependency for testing without affecting your production code.
+
+**Multi-platform**: Write once, run anywhere. Runner works in Node.js, browsers, and edge runtimes with platform adapters.
+
+## Platform support
+
+| Capability | Node.js | Browser | Edge | Notes |
+| --- | --- | --- | --- | --- |
+| Core runtime (tasks/resources/middleware/events/hooks) | Full | Full | Full | Platform adapters hide runtime differences |
+| Async Context (`r.asyncContext`) | Full | None | None | Requires Node.js `AsyncLocalStorage` |
+| Durable workflows (`@bluelibs/runner/node`) | Full | None | None | Node-only module |
+| Tunnels client (`createHttpClient`) | Full | Full | Full | Requires `fetch` |
+| Tunnels server (`@bluelibs/runner/node`) | Full | None | None | Exposes tasks/events over HTTP |
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Quick start" icon="rocket" href="/quickstart">
+    Get up and running in 5 minutes
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Detailed setup and prerequisites
+  </Card>
+  <Card title="Tasks" icon="code" href="/tasks">
+    Learn about business logic with DI
+  </Card>
+  <Card title="Resources" icon="database" href="/resources">
+    Manage singletons with lifecycle
+  </Card>
+</CardGroup>

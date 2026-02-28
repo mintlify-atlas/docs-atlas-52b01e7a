@@ -1,0 +1,392 @@
+---
+title: Tags
+description: Annotate and query components by tags for configuration and discovery
+---
+
+Tags let you **annotate components** with metadata and **query by tags** at runtime. Use them for feature grouping, configuration, cross-cutting concerns, and runtime discovery—all without tight coupling.
+
+## Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Feature Toggles" icon="toggle-on">
+    Mark tasks as "experimental" or "deprecated" and filter at runtime
+  </Card>
+  
+  <Card title="API Exposure" icon="cloud">
+    Tag tasks as "public" to expose them via HTTP tunnels
+  </Card>
+  
+  <Card title="Access Control" icon="shield">
+    Tag resources/tasks with required roles or permissions
+  </Card>
+  
+  <Card title="Discovery" icon="magnifying-glass">
+    Find all tasks with a specific tag for batch operations
+  </Card>
+</CardGroup>
+
+## Basic Usage
+
+Create tags and apply them to components:
+
+```typescript
+import { r } from "@bluelibs/runner";
+
+// Define tags
+const publicApiTag = r.tag("app.tags.publicApi").build();
+const auditedTag = r.tag("app.tags.audited").build();
+const experimentalTag = r.tag("app.tags.experimental").build();
+
+// Apply tags to tasks
+const getUser = r
+  .task("users.get")
+  .tags([publicApiTag]) // ← Tag this task
+  .run(async (input: { id: string }) => {
+    return { id: input.id, name: "Ada" };
+  })
+  .build();
+
+const updateUser = r
+  .task("users.update")
+  .tags([publicApiTag, auditedTag]) // ← Multiple tags
+  .run(async (input: { id: string; name: string }) => {
+    return { id: input.id, name: input.name };
+  })
+  .build();
+
+const experimentalFeature = r
+  .task("features.experimental")
+  .tags([experimentalTag])
+  .run(async () => "experimental")
+  .build();
+```
+
+## Querying by Tags
+
+Find components with specific tags at runtime:
+
+```typescript
+import { run, globals } from "@bluelibs/runner";
+
+const { runTask } = await run(app);
+
+// Query all tasks with publicApiTag
+const publicTasks = globals.resources.store.getTasksByTag(publicApiTag);
+console.log(publicTasks.map(t => t.id));
+// ["users.get", "users.update"]
+
+// Query resources by tag
+const auditedResources = globals.resources.store.getResourcesByTag(auditedTag);
+
+// Check if a specific task has a tag
+const isPublic = getUser.tags?.includes(publicApiTag);
+```
+
+## Tags with Configuration
+
+Tags can carry typed configuration:
+
+```typescript
+type AuthConfig = {
+  requiredRole: "user" | "admin" | "superadmin";
+  requiredPermissions?: string[];
+};
+
+const authTag = r
+  .tag<AuthConfig, void, void>("app.tags.auth")
+  .build();
+
+// Apply with configuration
+const adminTask = r
+  .task("admin.deleteUser")
+  .tags([authTag.with({ requiredRole: "admin" })])
+  .run(async (input: { userId: string }) => {
+    // Only admins can run this
+  })
+  .build();
+
+const superAdminTask = r
+  .task("admin.wipeData")
+  .tags([
+    authTag.with({
+      requiredRole: "superadmin",
+      requiredPermissions: ["data.delete"],
+    }),
+  ])
+  .run(async () => {
+    // Only superadmins with data.delete permission
+  })
+  .build();
+```
+
+## Tag Contracts (Type Enforcement)
+
+Enforce that tasks using a tag conform to specific input/output shapes:
+
+```typescript
+// Enforce that tasks accepting this tag must have userId in input
+const authorizedTag = r
+  .tag<void, { userId: string }, void>("app.tags.authorized")
+  .build();
+
+// ✅ Valid: input includes userId
+const validTask = r
+  .task("dashboard.view")
+  .tags([authorizedTag])
+  .run(async (input: { userId: string; view: "full" | "mini" }) => {
+    return { data: "dashboard data for " + input.userId };
+  })
+  .build();
+
+// ❌ Compile error: input missing userId
+const invalidTask = r
+  .task("public.view")
+  .tags([authorizedTag])
+  // @ts-expect-error - input doesn't satisfy contract { userId: string }
+  .run(async (input: { view: "full" }) => {
+    return { data: "public" };
+  })
+  .build();
+```
+
+Tag type parameters: `<TConfig, TEnforceIn, TEnforceOut>`
+- **TConfig**: Configuration passed via `.with()`
+- **TEnforceIn**: Required input properties for tasks
+- **TEnforceOut**: Required output properties for tasks
+
+## Middleware Based on Tags
+
+Apply middleware to all tasks with a specific tag:
+
+```typescript
+import { r, globals } from "@bluelibs/runner";
+
+const auditedTag = r.tag("app.tags.audited").build();
+
+// Middleware that applies to all audited tasks
+const auditMiddleware = r.middleware
+  .task("app.middleware.audit")
+  .everywhere((task) => task.definition.tags?.includes(auditedTag))
+  .dependencies({ logger: globals.resources.logger })
+  .run(async ({ task, next }, { logger }) => {
+    const start = Date.now();
+    await logger.info("Audit: task started", {
+      taskId: task.definition.id,
+      input: task.input,
+    });
+    
+    const result = await next(task.input);
+    
+    await logger.info("Audit: task completed", {
+      taskId: task.definition.id,
+      duration: Date.now() - start,
+    });
+    
+    return result;
+  })
+  .build();
+
+const app = r
+  .resource("app")
+  .register([
+    auditMiddleware, // Automatically applies to all audited tasks
+    updateUser,      // Has auditedTag
+    deleteUser,      // Has auditedTag
+  ])
+  .build();
+```
+
+## Resource Tags
+
+Tags work on resources too:
+
+```typescript
+const databaseTag = r
+  .tag<void, { connectionString: string }, { connect(): Promise<void> }>(
+    "app.tags.database"
+  )
+  .build();
+
+const postgresDb = r
+  .resource("app.db.postgres")
+  .tags([databaseTag])
+  .init(async (config: { connectionString: string }) => ({
+    connect: async () => { /* ... */ },
+    query: async (sql: string) => { /* ... */ },
+  }))
+  .build();
+
+// Query all database resources
+const databases = globals.resources.store.getResourcesByTag(databaseTag);
+```
+
+## Tag Metadata
+
+Add rich metadata to tags:
+
+```typescript
+const deprecatedTag = r
+  .tag("app.tags.deprecated")
+  .meta({
+    description: "This component is deprecated and will be removed in v2.0",
+    replacedBy: "app.tasks.newImplementation",
+    removalDate: "2025-12-31",
+  })
+  .build();
+
+const oldTask = r
+  .task("legacy.doSomething")
+  .tags([deprecatedTag])
+  .meta({
+    description: "Old implementation - use newImplementation instead",
+  })
+  .run(async () => "old")
+  .build();
+
+// Access metadata
+console.log(deprecatedTag.meta);
+// { description: "...", replacedBy: "...", removalDate: "..." }
+```
+
+## HTTP Tunnel Integration
+
+Tags integrate with HTTP tunnels for selective exposure:
+
+```typescript
+import { createHttpExposure } from "@bluelibs/runner/node";
+
+const publicApiTag = r.tag("app.tags.publicApi").build();
+
+const exposure = createHttpExposure(app, {
+  taskFilter: (task) => task.tags?.includes(publicApiTag),
+});
+
+// Only tasks with publicApiTag are exposed over HTTP
+```
+
+See [HTTP Tunnels](/node/http-tunnels) for more.
+
+## Store API Reference
+
+<ParamField path="store.getTasksByTag" type="function">
+  Find all tasks with a specific tag
+  
+  ```typescript
+  getTasksByTag(tag: TagType): ITask[]
+  ```
+</ParamField>
+
+<ParamField path="store.getResourcesByTag" type="function">
+  Find all resources with a specific tag
+  
+  ```typescript
+  getResourcesByTag(tag: TagType): IResource[]
+  ```
+</ParamField>
+
+<ParamField path="store.getAllTags" type="function">
+  Get all registered tags
+  
+  ```typescript
+  getAllTags(): TagType[]
+  ```
+</ParamField>
+
+## Validation with Config Schema
+
+Validate tag configuration at registration time:
+
+```typescript
+import { z } from "zod";
+
+const rateLimitSchema = z.object({
+  requestsPerMinute: z.number().positive(),
+  burstSize: z.number().positive(),
+});
+
+const rateLimitTag = r
+  .tag<z.infer<typeof rateLimitSchema>, void, void>("app.tags.rateLimit")
+  .configSchema(rateLimitSchema)
+  .build();
+
+// ✅ Valid
+const limitedTask = r
+  .task("api.search")
+  .tags([rateLimitTag.with({ requestsPerMinute: 100, burstSize: 10 })])
+  .run(async () => "results")
+  .build();
+
+// ❌ Throws validation error
+try {
+  rateLimitTag.with({ requestsPerMinute: -5, burstSize: 10 });
+} catch (error) {
+  console.error("Invalid rate limit config");
+}
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Use Semantic Names" icon="tag">
+    Name tags clearly: `app.tags.publicApi`, not `myTag`
+  </Card>
+  
+  <Card title="Document Tag Meaning" icon="book">
+    Use `.meta()` to explain what a tag signifies
+  </Card>
+  
+  <Card title="Keep Tag Config Simple" icon="circle">
+    Don't pack complex state into tag config—use resources for that
+  </Card>
+  
+  <Card title="Use Type Contracts" icon="shield-check">
+    Enforce input/output contracts with `TEnforceIn` and `TEnforceOut`
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Feature Flags
+
+```typescript
+const featureFlagTag = r
+  .tag<{ enabled: boolean }, void, void>("app.tags.featureFlag")
+  .build();
+
+const experimentalTask = r
+  .task("features.newSearch")
+  .tags([featureFlagTag.with({ enabled: false })])
+  .run(async () => "new search")
+  .build();
+
+// At runtime, check if feature is enabled
+const isEnabled = experimentalTask.tags
+  ?.find(t => t.id === featureFlagTag.id)
+  ?.config?.enabled;
+```
+
+### Batch Operations
+
+```typescript
+// Tag all tasks that need to be warmed up
+const warmupTag = r.tag("app.tags.warmup").build();
+
+const app = r.resource("app")
+  .register([task1, task2, task3])
+  .init(async (_cfg, deps, _ctx, { store }) => {
+    const warmupTasks = store.getTasksByTag(warmupTag);
+    await Promise.all(
+      warmupTasks.map(task => 
+        runtime.runTask(task, {}).catch(() => {})
+      )
+    );
+  })
+  .build();
+```
+
+## See Also
+
+- [Type Contracts](/advanced/dependency-injection) - Enforce input/output shapes with tags
+- [Middleware](/middleware/overview) - Apply middleware based on tags
+- [HTTP Tunnels](/node/http-tunnels) - Expose tasks by tag
+- [Testing](/testing/overview) - Query tasks by tag for test setup

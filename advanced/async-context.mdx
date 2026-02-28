@@ -1,0 +1,334 @@
+---
+title: Async Context
+description: Request-scoped state that flows through your async operations without prop drilling
+---
+
+Async Context provides **request-scoped state** that automatically flows through your async operations—no prop drilling required. It's built on Node.js's `AsyncLocalStorage`, giving you a clean way to carry data like request IDs, user sessions, or trace information through your entire call stack.
+
+<Warning>
+  **Node.js Only**: Async Context requires Node.js's `AsyncLocalStorage` API and is not available in browser or edge runtimes. For non-Node environments, pass context explicitly through function parameters.
+</Warning>
+
+## When to Use Async Context
+
+Async Context excels at carrying cross-cutting concerns through your application:
+
+- **Request tracing**: Carry a `requestId` or `traceId` through all operations
+- **User sessions**: Access the current user without passing it everywhere
+- **Database transactions**: Share a transaction across multiple operations
+- **Logging context**: Automatically include request metadata in all logs
+
+## Basic Usage
+
+Define a context, provide values at the entry point, and read from anywhere in the call stack:
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+// 1. Define your context shape
+const requestContext = r
+  .asyncContext<{ requestId: string; userId?: string }>("app.ctx.request")
+  .build();
+
+// 2. Wrap your request handler
+async function handleRequest(req: Request) {
+  await requestContext.provide(
+    { requestId: crypto.randomUUID() },
+    async () => {
+      // Everything inside here can access the context
+      await processRequest(req);
+    }
+  );
+}
+
+// 3. Read from anywhere in the call stack
+async function processRequest(req: Request) {
+  const ctx = requestContext.use();
+  console.log(`Processing request ${ctx.requestId}`);
+}
+```
+
+## Using Context in Tasks
+
+The real power comes when you inject context into your tasks:
+
+```typescript
+const auditLog = r
+  .task("app.tasks.auditLog")
+  .dependencies({ requestContext, logger: globals.resources.logger })
+  .run(async (message: string, { requestContext, logger }) => {
+    const ctx = requestContext.use();
+    await logger.info(message, {
+      requestId: ctx.requestId,
+      userId: ctx.userId,
+    });
+  })
+  .build();
+
+// Register the context alongside your tasks
+const app = r
+  .resource("app")
+  .register([requestContext, auditLog])
+  .build();
+```
+
+## API Reference
+
+### defineAsyncContext
+
+Create a new typed async context.
+
+<ParamField path="definition" type="object" required>
+  Context configuration
+  
+  <Expandable title="properties">
+    <ParamField path="id" type="string" required>
+      Unique identifier for this context
+    </ParamField>
+    
+    <ParamField path="configSchema" type="IValidationSchema<T>">
+      Optional validation schema for context values (e.g., Zod schema)
+    </ParamField>
+    
+    <ParamField path="serialize" type="(data: T) => string">
+      Custom serialization function for context values
+    </ParamField>
+    
+    <ParamField path="parse" type="(data: string) => T">
+      Custom deserialization function for context values
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+### Context Methods
+
+<ParamField path="provide" type="function">
+  Establish a context scope with the given value
+  
+  ```typescript
+  provide<R>(value: T, fn: () => Promise<R> | R): Promise<R> | R
+  ```
+  
+  All async operations within `fn` can access the context via `use()`.
+</ParamField>
+
+<ParamField path="use" type="function">
+  Read the current context value
+  
+  ```typescript
+  use(): T
+  ```
+  
+  Throws `ContextError` if called outside a `provide()` scope.
+</ParamField>
+
+<ParamField path="require" type="function">
+  Return middleware that enforces context availability
+  
+  ```typescript
+  require(): ITaskMiddlewareConfigured
+  ```
+  
+  Tasks with this middleware will throw if executed outside a context scope.
+</ParamField>
+
+<ParamField path="optional" type="function">
+  Mark this context as an optional dependency
+  
+  ```typescript
+  optional(): { inner: IAsyncContext<T>; [symbolOptionalDependency]: true }
+  ```
+</ParamField>
+
+## Requiring Context with Middleware
+
+Force tasks to run only within a context boundary:
+
+```typescript
+const securedTask = r
+  .task("app.tasks.secured")
+  .middleware([requestContext.require()]) // Throws if context not provided
+  .run(async (input) => {
+    const ctx = requestContext.use(); // Guaranteed to exist
+    return { processedBy: ctx.userId };
+  })
+  .build();
+```
+
+## Express Integration Example
+
+```typescript
+import express from "express";
+import { r, run } from "@bluelibs/runner";
+
+const requestContext = r
+  .asyncContext<{ requestId: string; userId?: string }>("app.ctx.request")
+  .build();
+
+const app = express();
+
+// Middleware to establish context for each request
+app.use((req, res, next) => {
+  requestContext.provide(
+    {
+      requestId: req.headers["x-request-id"] || crypto.randomUUID(),
+      userId: req.user?.id,
+    },
+    () => next()
+  );
+});
+
+// Any task called during this request can access the context
+app.get("/api/data", async (req, res) => {
+  const result = await runtime.runTask(fetchData, req.params);
+  res.json(result);
+});
+```
+
+## Custom Serialization
+
+By default, Runner preserves Dates, RegExp, and other types across async boundaries. For custom types:
+
+```typescript
+interface User {
+  id: string;
+  name: string;
+  createdAt: Date;
+}
+
+const sessionContext = r
+  .asyncContext<{ user: User }>("app.ctx.session")
+  .serialize((data) => JSON.stringify({
+    user: {
+      ...data.user,
+      createdAt: data.user.createdAt.toISOString(),
+    },
+  }))
+  .parse((raw) => {
+    const parsed = JSON.parse(raw);
+    return {
+      user: {
+        ...parsed.user,
+        createdAt: new Date(parsed.user.createdAt),
+      },
+    };
+  })
+  .build();
+```
+
+## Validation with Zod
+
+Validate context values at runtime:
+
+```typescript
+import { z } from "zod";
+
+const requestSchema = z.object({
+  requestId: z.string().uuid(),
+  userId: z.string().optional(),
+  tenantId: z.string(),
+});
+
+const requestContext = r
+  .asyncContext<z.infer<typeof requestSchema>>("app.ctx.request")
+  .configSchema(requestSchema)
+  .build();
+
+// This will throw validation error
+requestContext.provide(
+  { requestId: "invalid-uuid", tenantId: "tenant-123" },
+  async () => {
+    // Won't reach here
+  }
+);
+```
+
+## Multi-Tenant Example
+
+```typescript
+const tenantContext = r
+  .asyncContext<{ tenantId: string; permissions: string[] }>("app.ctx.tenant")
+  .build();
+
+const getTenantData = r
+  .task("app.tasks.getTenantData")
+  .dependencies({ db, tenantContext })
+  .middleware([tenantContext.require()])
+  .run(async (params, { db, tenantContext }) => {
+    const { tenantId } = tenantContext.use();
+    return db.query("SELECT * FROM data WHERE tenant_id = ?", [tenantId]);
+  })
+  .build();
+
+// Usage
+await tenantContext.provide(
+  { tenantId: "tenant-123", permissions: ["read", "write"] },
+  async () => {
+    const data = await runtime.runTask(getTenantData, {});
+    // Data automatically scoped to tenant-123
+  }
+);
+```
+
+## Error Handling
+
+```typescript
+import { ContextError } from "@bluelibs/runner";
+
+try {
+  // Attempting to use context outside a provide() scope
+  const ctx = requestContext.use();
+} catch (error) {
+  if (error instanceof ContextError) {
+    console.error("Context not available:", error.message);
+  }
+}
+```
+
+## Best Practices
+
+<CardGroup cols={2}>
+  <Card title="Establish at Entry Points" icon="door-open">
+    Call `provide()` at HTTP handlers, queue consumers, or other entry points
+  </Card>
+  
+  <Card title="Keep Contexts Focused" icon="bullseye">
+    Create separate contexts for different concerns (request, tenant, auth)
+  </Card>
+  
+  <Card title="Use require() for Critical Paths" icon="shield">
+    Force context availability with `.require()` middleware for security-sensitive tasks
+  </Card>
+  
+  <Card title="Avoid Context Mutation" icon="lock">
+    Treat context values as immutable; create new scopes with `provide()` for changes
+  </Card>
+</CardGroup>
+
+## Performance Notes
+
+- Context lookup via `use()` is extremely fast (~microseconds)
+- Context values are not copied; they're stored by reference
+- Nested `provide()` calls create new context scopes without affecting parent scopes
+- Validation only runs when `configSchema` is provided
+
+## Platform Detection
+
+Runner automatically detects platform capabilities:
+
+```typescript
+import { getPlatform } from "@bluelibs/runner";
+
+const platform = getPlatform();
+if (!platform.hasAsyncLocalStorage()) {
+  console.warn("Async Context not available on this platform");
+}
+```
+
+Attempting to create async context on unsupported platforms throws `platformUnsupportedFunctionError`.
+
+## See Also
+
+- [Dependency Injection](/advanced/dependency-injection) - Explicit dependencies vs. async context
+- [Error Handling](/advanced/error-handling) - Handling ContextError
+- [Multi-Platform Architecture](/guides/multi-platform) - Platform-specific features

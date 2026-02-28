@@ -1,0 +1,219 @@
+---
+title: "run()"
+description: "Execute a resource and create a runtime instance"
+---
+
+## Overview
+
+The `run()` function is the entry point for starting your Runner application. It initializes a resource (and all its dependencies), manages the lifecycle, and returns a runtime instance for executing tasks and emitting events.
+
+```typescript
+import { r, run } from "@bluelibs/runner";
+
+const app = r.resource("app")
+  .register([myTask, myService])
+  .build();
+
+const runtime = await run(app);
+await runtime.runTask(myTask, { name: "Ada" });
+await runtime.dispose();
+```
+
+## Signature
+
+```typescript
+async function run<C, V extends Promise<any>>(
+  resourceOrResourceWithConfig:
+    | IResourceWithConfig<C, V>
+    | IResource<void, V, any, any>
+    | IResource<{ [K in any]?: any }, V, any, any>,
+  options?: RunOptions
+): Promise<RunResult<V extends Promise<infer U> ? U : V>>
+```
+
+## Parameters
+
+<ParamField path="resourceOrResourceWithConfig" type="IResource | IResourceWithConfig" required>
+  The resource to run, optionally with configuration.
+  
+  **Pass without config:**
+  ```typescript
+  const runtime = await run(app);
+  ```
+  
+  **Pass with config:**
+  ```typescript
+  const runtime = await run(app.with({ port: 3000 }));
+  ```
+</ParamField>
+
+<ParamField path="options" type="RunOptions">
+  Configuration options for the runtime.
+  
+  <Expandable title="RunOptions properties">
+    <ParamField path="debug" type="DebugFriendlyConfig">
+      Enable debug mode with logging to console.
+    </ParamField>
+    
+    <ParamField path="logs" type="object">
+      Configure logging settings.
+      
+      <Expandable title="logs properties">
+        <ParamField path="printThreshold" type="LogLevels | null" default="info">
+          Minimum log level to print. Use `null` to disable logging. In test environment (NODE_ENV=test), defaults to `null`.
+        </ParamField>
+        
+        <ParamField path="printStrategy" type="'pretty' | 'json'" default="pretty">
+          Format for log output.
+        </ParamField>
+        
+        <ParamField path="bufferLogs" type="boolean" default="false">
+          Buffer logs until root resource is ready.
+        </ParamField>
+      </Expandable>
+    </ParamField>
+    
+    <ParamField path="errorBoundary" type="boolean" default="true">
+      Install a central error boundary to catch uncaught process-level errors.
+    </ParamField>
+    
+    <ParamField path="shutdownHooks" type="boolean" default="true">
+      Install SIGINT/SIGTERM handlers for graceful shutdown.
+    </ParamField>
+    
+    <ParamField path="onUnhandledError" type="OnUnhandledError">
+      Custom handler for unhandled errors. Defaults to logging via the created logger.
+    </ParamField>
+    
+    <ParamField path="dryRun" type="boolean" default="false">
+      Validate setup without initializing resources or emitting events. Useful for testing.
+    </ParamField>
+    
+    <ParamField path="runtimeEventCycleDetection" type="boolean" default="true">
+      Enable runtime cycle detection for event emissions. Disable to improve performance if you're certain there are no cycles.
+    </ParamField>
+    
+    <ParamField path="lazy" type="boolean" default="false">
+      Skip initializing unused resources at startup. Load them on-demand via `getLazyResourceValue()`.
+    </ParamField>
+    
+    <ParamField path="initMode" type="'sequential' | 'parallel'" default="sequential">
+      Control how resources are initialized during startup.
+      - `sequential`: Initialize resources one at a time (safer, deterministic)
+      - `parallel`: Initialize resources concurrently (faster)
+    </ParamField>
+    
+    <ParamField path="mode" type="'dev' | 'prod' | 'test'">
+      Specify the runtime mode. Automatically detected from NODE_ENV if not provided.
+    </ParamField>
+  </Expandable>
+</ParamField>
+
+## Returns
+
+<ResponseField name="runtime" type="RunResult<V>">
+  A runtime instance providing access to:
+  - Task execution via `runTask()`
+  - Event emission via `emitEvent()`
+  - Resource access via `getResourceValue()` / `getLazyResourceValue()`
+  - Root access via `getRootValue()`, `getRootConfig()`, `getRootId()`
+  - Lifecycle management via `dispose()`
+  
+  See [Runtime API](/api/runtime/runtime) for details.
+</ResponseField>
+
+## Examples
+
+### Basic Usage
+
+```typescript
+const app = r.resource("app")
+  .register([greetTask])
+  .build();
+
+const runtime = await run(app);
+const greeting = await runtime.runTask(greetTask, { name: "World" });
+console.log(greeting); // "Hello, World!"
+await runtime.dispose();
+```
+
+### With Configuration
+
+```typescript
+const server = r.resource("server")
+  .configSchema<{ port: number }>({ parse: (v) => v })
+  .init(({ config }) => {
+    return startServer(config.port);
+  })
+  .build();
+
+const runtime = await run(server.with({ port: 3000 }));
+```
+
+### With Options
+
+```typescript
+const runtime = await run(app, {
+  logs: {
+    printThreshold: "debug",
+    printStrategy: "json",
+  },
+  lazy: true,
+  initMode: "parallel",
+});
+```
+
+### Dry Run (Testing)
+
+```typescript
+// Validate setup without running
+const runtime = await run(app, { dryRun: true });
+// No resources initialized, no events emitted
+await runtime.dispose();
+```
+
+### Custom Error Handling
+
+```typescript
+const runtime = await run(app, {
+  onUnhandledError: async (error, context) => {
+    await reportToSentry(error);
+    console.error("Unhandled error:", error);
+  },
+});
+```
+
+## Lifecycle
+
+When you call `run()`, the following happens:
+
+1. **Registration Phase**: All resources, tasks, events, hooks, and middleware are registered
+2. **Validation Phase**: Dependency graph and event emission graph are validated
+3. **Override Processing**: Any overrides are applied
+4. **Listener Attachment**: Event hooks are attached to their events
+5. **Dependency Computation**: Dependency injection is resolved
+6. **Resource Initialization**: Resources are initialized (sequentially or in parallel)
+7. **Ready Event**: `globals.events.ready` is emitted
+8. **Runtime Active**: The runtime is now ready to execute tasks and emit events
+
+## Error Handling
+
+If initialization fails, `run()` will:
+1. Throw the error
+2. Automatically dispose all already-initialized resources
+3. Unhook process-level safety nets
+
+```typescript
+try {
+  const runtime = await run(app);
+} catch (error) {
+  console.error("Failed to start:", error);
+  // Resources already cleaned up automatically
+}
+```
+
+## Related
+
+- [Runtime API](/api/runtime/runtime) - Working with the runtime instance
+- [Resource Builder](/api/builders/resource) - Creating resources
+- [RunResult](/api/runtime/runtime) - Runtime instance methods
